@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Optional
+
+from pydantic import BaseModel
+
+
+class IngresoImputacionResponse(BaseModel):
+    id: int
+    pago_proveedor_id: int
+    importe_aplicado: Decimal
+    fecha_pago: datetime
+    tipo_pago: str
+    referencia_pago: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class IngresoMercaderiaItemCreate(BaseModel):
+    producto_id: int
+    cantidad_cajas: int = 0
+    cantidad_blisters: int = 0
+    costo_unitario: Optional[float] = None
+
+
+class IngresoMercaderiaItemResponse(IngresoMercaderiaItemCreate):
+    id: int
+    producto_nombre: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class IngresoMercaderiaBase(BaseModel):
+    fecha: date
+    proveedor_id: Optional[int] = None
+    numero_comprobante: str
+    observacion: Optional[str] = None
+    fecha_vencimiento: Optional[datetime] = None
+    dias_plazo: Optional[int] = None
+
+
+class IngresoMercaderiaCreate(IngresoMercaderiaBase):
+    destino: str = "A"  # "A" o "B" para Stock Blanco/Negro
+    items: list[IngresoMercaderiaItemCreate]
+
+
+class IngresoMercaderiaResponse(IngresoMercaderiaBase):
+    id: int
+    numero: str
+    destino: str = "A"
+    creado_por_id: int
+    creado_por_nombre: Optional[str] = None
+    proveedor_nombre: Optional[str] = None
+    items: list[IngresoMercaderiaItemResponse] = []
+    importe_total: float = 0.0
+    saldo_pendiente: float = 0.0
+    imputaciones: list[IngresoImputacionResponse] = []
+    created_at: datetime
+    updated_at: datetime
+    archivo_url: Optional[str] = None
+
+    model_config = {"from_attributes": True}

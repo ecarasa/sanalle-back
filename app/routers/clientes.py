@@ -1,0 +1,699 @@
+from typing import Any
+import io
+
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_
+from app.core.database import get_db
+from app.core.security import get_password_hash
+from app.models.cliente import Cliente
+from app.models.pedido import Pedido, EstadoDespacho
+from app.models.pago import Pago, EstadoPago
+from app.models.user import User, RolUsuario
+from app.models.localidad import Localidad
+from app.models.zona import Zona
+from app.schemas.cliente import ClienteCreate, ClienteUpdate, ClienteResponse, ClienteConDeuda
+from app.utils.deps import get_current_user, require_role
+from app.utils.filters import apply_column_filters
+from app.services.semaforo_service import calcular_semaforo
+from app.services.geolocating import obtener_coordenadas_osm
+from decimal import Decimal
+
+
+router = APIRouter()
+
+
+def _pedidos_subquery(cliente_id_col, tipo_doc=None):
+    """Subquery: sum of importe_total for pedidos with active states."""
+    filters = [
+        Pedido.cliente_id == cliente_id_col,
+        Pedido.shipping_status != EstadoDespacho.cancelado,
+    ]
+    if tipo_doc:
+        filters.append(Pedido.tipo_documento == tipo_doc)
+    
+    return (
+        select(func.coalesce(func.sum(Pedido.importe_total), 0))
+        .where(and_(*filters))
+        .correlate(Cliente)
+        .scalar_subquery()
+    )
+
+
+def _pagos_subquery(cliente_id_col, tipo_cuenta=None):
+    """Subquery: sum of importe for pagos with active states."""
+    filters = [
+        Pago.cliente_id == cliente_id_col,
+        Pago.estado.in_([
+            EstadoPago.pendiente,
+            EstadoPago.acreditado,
+            EstadoPago.recibido,
+            EstadoPago.imputado,
+        ]),
+    ]
+    if tipo_cuenta:
+        filters.append(Pago.tipo_cuenta == tipo_cuenta)
+
+    return (
+        select(func.coalesce(func.sum(Pago.importe), 0))
+        .where(and_(*filters))
+        .correlate(Cliente)
+        .scalar_subquery()
+    )
+
+
+def _notas_subquery(cliente_id_col, tipo_cuenta=None, tipo_nota=None):
+    """Subquery: sum of importe_total for notas with active states."""
+    from app.models.nota_credito_debito import NotaCreditoDebito, TipoNota
+    filters = [NotaCreditoDebito.cliente_id == cliente_id_col]
+    if tipo_cuenta:
+        filters.append(NotaCreditoDebito.tipo_cuenta == tipo_cuenta)
+    if tipo_nota:
+        filters.append(NotaCreditoDebito.tipo == tipo_nota)
+
+    return (
+        select(func.coalesce(func.sum(NotaCreditoDebito.importe_total), 0))
+        .where(and_(*filters))
+        .correlate(Cliente)
+        .scalar_subquery()
+    )
+
+
+@router.get("")
+async def list_clientes(
+    search: str = Query("", description="Buscar por nombre, CUIT o razón social"),
+    column_filters: str | None = Query(None, alias="filters", description="JSON column filters"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Deuda Remitos
+    deuda_remito_expr = (
+        _pedidos_subquery(Cliente.id, "remito") 
+        - _pagos_subquery(Cliente.id, "remito")
+        + _notas_subquery(Cliente.id, "remito", "debito")
+        - _notas_subquery(Cliente.id, "remito", "credito")
+        + Cliente.deuda_inicial_remito
+    )
+    
+    # Deuda Facturas
+    deuda_factura_expr = (
+        _pedidos_subquery(Cliente.id, "factura")
+        - _pagos_subquery(Cliente.id, "factura")
+        + _notas_subquery(Cliente.id, "factura", "debito")
+        - _notas_subquery(Cliente.id, "factura", "credito")
+        + Cliente.deuda_inicial_factura
+    )
+
+    deuda_expr = deuda_remito_expr + deuda_factura_expr
+
+    base_filter = Cliente.activo == True  # noqa: E712
+    # ... rest of filters ...
+    if current_user.rol.value == "ventas":
+        base_filter = and_(base_filter, Cliente.vendedor_id == current_user.id)
+    else:
+        base_filter = and_(base_filter, Cliente.aprobado == True)  # noqa: E712
+
+    if search:
+        like_pattern = f"%{search}%"
+        search_filter = and_(
+            base_filter,
+            (
+                Cliente.nombre.ilike(like_pattern)
+                | Cliente.cuit.ilike(like_pattern)
+                | Cliente.razon_social.ilike(like_pattern)
+            ),
+        )
+    else:
+        search_filter = base_filter
+
+    base_query = select(Cliente).where(search_filter)
+
+    from app.models.localidad import Localidad
+    from app.models.zona import Zona
+
+    base_query = apply_column_filters(
+        base_query,
+        Cliente,
+        column_filters,
+        allowed_columns={
+            "nombre", "razon_social", "cuit", "localidad_nombre", "zona_nombre",
+            "domicilio", "activo", "categoria", "tipo", "condicion_pago"
+        },
+        extra_mappings={
+            "localidad_nombre": Localidad.nombre,
+            "zona_nombre": Zona.nombre
+        }
+    )
+
+    oldest_pedido_fecha_subquery = (
+        select(func.min(Pedido.fecha))
+        .where(
+            and_(
+                Pedido.cliente_id == Cliente.id,
+                Pedido.saldo_pendiente > 0,
+                Pedido.shipping_status != EstadoDespacho.cancelado,
+            )
+        )
+        .correlate(Cliente)
+        .scalar_subquery()
+    )
+
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total_result = await db.execute(count_query)
+    total = total_result.scalar_one()
+
+    deuda_query = (
+        select(
+            Cliente, 
+            deuda_expr.label("deuda"), 
+            deuda_remito_expr.label("deuda_remitos"),
+            deuda_factura_expr.label("deuda_facturas"),
+            oldest_pedido_fecha_subquery.label("oldest_pedido_fecha"),
+            User.nombre_completo.label("vendedor_nombre"), 
+            Localidad.nombre.label("localidad_nombre"),
+            Zona.nombre.label("zona_nombre")
+        )
+        .outerjoin(User, Cliente.vendedor_id == User.id)
+        .outerjoin(Localidad, Cliente.localidad_id == Localidad.id)
+        .outerjoin(Zona, Cliente.zona_id == Zona.id)
+        .where(Cliente.id.in_(select(base_query.with_only_columns(Cliente.id).subquery().c.id)))
+        .order_by(Cliente.nombre)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    result = await db.execute(deuda_query)
+    rows = result.all()
+
+    items = []
+    from datetime import date
+    today = date.today()
+
+    for cliente, deuda, deuda_remitos, deuda_facturas, oldest_fecha, vendedor_nombre, localidad_nombre, zona_nombre in rows:
+        cliente_dict = ClienteResponse.model_validate(cliente).model_dump()
+        deuda_float = float(deuda) if deuda else 0.0
+        cliente_dict["deuda"] = deuda_float
+        cliente_dict["saldo_remitos"] = float(deuda_remitos) if deuda_remitos else 0.0
+        cliente_dict["saldo_facturas"] = float(deuda_facturas) if deuda_facturas else 0.0
+        cliente_dict["vendedor_nombre"] = vendedor_nombre
+        cliente_dict["localidad_nombre"] = localidad_nombre
+        cliente_dict["zona_nombre"] = zona_nombre
+        
+        # Determine days overdue for semaphore
+        days_overdue = None
+        if oldest_fecha:
+            days_overdue = (today - oldest_fecha).days
+        elif (cliente_dict["saldo_remitos"] > 0 or cliente_dict["saldo_facturas"] > 0):
+            # If there is debt but no active pending order found, it must be from deuda_inicial
+            # or legacy imputations. We treat it as old debt.
+            days_overdue = None # calcular_semaforo handles None as "old debt" case
+            
+        cliente_dict["semaforo"] = calcular_semaforo(deuda_float, days_overdue)
+        cliente_dict["dias_mora"] = days_overdue
+        items.append(ClienteConDeuda(**cliente_dict))
+
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get("/pendientes")
+async def list_clientes_pendientes(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    search: str = Query("", max_length=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    """List clients pending approval."""
+    base_query = select(Cliente).where(
+        and_(Cliente.aprobado == False, Cliente.activo == True)  # noqa: E712
+    )
+
+    if search:
+        search_filter = or_(
+            Cliente.nombre.ilike(f"%{search}%"),
+            Cliente.cuit.ilike(f"%{search}%"),
+        )
+        base_query = base_query.where(search_filter)
+
+    count_q = select(func.count()).select_from(base_query.subquery())
+    total = (await db.execute(count_q)).scalar_one()
+
+    result = await db.execute(
+        select(Cliente, User.nombre_completo.label("vendedor_nombre"), Localidad.nombre.label("localidad_nombre"), Zona.nombre.label("zona_nombre"))
+        .outerjoin(User, Cliente.vendedor_id == User.id)
+        .outerjoin(Localidad, Cliente.localidad_id == Localidad.id)
+        .outerjoin(Zona, Cliente.zona_id == Zona.id)
+        .where(Cliente.id.in_(select(base_query.with_only_columns(Cliente.id).subquery().c.id)))
+        .order_by(Cliente.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    rows = result.all()
+
+    items = []
+    for cliente, vendedor_nombre, localidad_nombre, zona_nombre in rows:
+        d = ClienteResponse.model_validate(cliente).model_dump()
+        d["vendedor_nombre"] = vendedor_nombre
+        d["localidad_nombre"] = localidad_nombre
+        d["zona_nombre"] = zona_nombre
+        d["deuda"] = 0
+        items.append(ClienteConDeuda(**d))
+
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.patch("/{id}/aprobar")
+async def aprobar_cliente(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    result = await db.execute(select(Cliente).where(Cliente.id == id))
+    cliente = result.scalar_one_or_none()
+    if not cliente:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    cliente.aprobado = True
+    await db.commit()
+    return {"message": f"Cliente {cliente.nombre} aprobado"}
+
+
+@router.get("/{id}", response_model=ClienteResponse)
+async def get_cliente(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Cliente).where(Cliente.id == id))
+    cliente = result.scalar_one_or_none()
+    if cliente is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Cliente no encontrado",
+        )
+    return cliente
+
+
+async def _update_cliente_coords(cliente: Cliente, db: AsyncSession):
+    """Helper to update lat/lon using the geolocating service."""
+    if cliente.domicilio and cliente.localidad_id:
+        # Fetch localidad name
+        result = await db.execute(select(Localidad).where(Localidad.id == cliente.localidad_id))
+        localidad = result.scalar_one_or_none()
+        if localidad:
+            lat, lon = await obtener_coordenadas_osm(cliente.domicilio, localidad.nombre)
+            if lat is not None and lon is not None:
+                print(f"Coordenadas obtenidas: {lat}, {lon}")
+                cliente.latitud = lat
+                cliente.longitud = lon
+
+
+@router.post("", response_model=ClienteResponse, status_code=status.HTTP_201_CREATED)
+
+async def create_cliente(
+    body: ClienteCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Ventas can create clients (pending approval), admin creates approved
+    is_admin = current_user.rol.value in ("admin", "super_admin")
+    if not is_admin and current_user.rol.value != "ventas":
+        raise HTTPException(status_code=403, detail="No tiene permisos para crear clientes")
+
+    data = body.model_dump()
+    if not is_admin:
+        data["aprobado"] = False
+        data["vendedor_id"] = current_user.id
+
+    cliente = Cliente(**data)
+    # Geocodificación automática para carga manual
+    await _update_cliente_coords(cliente, db)
+    db.add(cliente)
+
+    await db.commit()
+    await db.refresh(cliente)
+    return cliente
+
+
+@router.put("/{id}", response_model=ClienteResponse)
+async def update_cliente(
+    id: int,
+    body: ClienteUpdate,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    result = await db.execute(select(Cliente).where(Cliente.id == id))
+    cliente = result.scalar_one_or_none()
+    if cliente is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Cliente no encontrado",
+        )
+
+    update_data = body.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(cliente, field, value)
+
+    # Si cambió domicilio o localidad, actualizar coordenadas
+    if "domicilio" in update_data or "localidad_id" in update_data:
+        await _update_cliente_coords(cliente, db)
+
+    await db.commit()
+
+    await db.refresh(cliente)
+    return cliente
+
+
+@router.delete("/{id}")
+async def delete_cliente(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    result = await db.execute(select(Cliente).where(Cliente.id == id))
+    cliente = result.scalar_one_or_none()
+    if cliente is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Cliente no encontrado",
+        )
+
+    cliente.activo = False
+    await db.commit()
+    return {"message": f"Cliente {cliente.nombre} desactivado"}
+
+
+@router.get("/{id}/deuda")
+async def get_cliente_deuda(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    from app.models.nota_credito_debito import NotaCreditoDebito, TipoNota
+
+    result = await db.execute(select(Cliente).where(Cliente.id == id))
+    cliente = result.scalar_one_or_none()
+    if cliente is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Cliente no encontrado",
+        )
+
+    # Helper function for aggregated values
+    async def get_sum(subquery):
+        res = await db.execute(subquery)
+        return float(res.scalar_one() or 0)
+
+    # Pedidos
+    p_rem = await get_sum(select(func.coalesce(func.sum(Pedido.importe_total), 0)).where(and_(Pedido.cliente_id == id, Pedido.tipo_documento == "remito", Pedido.shipping_status != EstadoDespacho.cancelado)))
+    p_fac = await get_sum(select(func.coalesce(func.sum(Pedido.importe_total), 0)).where(and_(Pedido.cliente_id == id, Pedido.tipo_documento == "factura", Pedido.shipping_status != EstadoDespacho.cancelado)))
+
+    # Pagos
+    pag_rem = await get_sum(select(func.coalesce(func.sum(Pago.importe), 0)).where(and_(Pago.cliente_id == id, Pago.tipo_cuenta == "remito", Pago.estado.in_([EstadoPago.pendiente, EstadoPago.acreditado, EstadoPago.recibido, EstadoPago.imputado]))))
+    pag_fac = await get_sum(select(func.coalesce(func.sum(Pago.importe), 0)).where(and_(Pago.cliente_id == id, Pago.tipo_cuenta == "factura", Pago.estado.in_([EstadoPago.pendiente, EstadoPago.acreditado, EstadoPago.recibido, EstadoPago.imputado]))))
+
+    # Notas
+    nc_rem = await get_sum(select(func.coalesce(func.sum(NotaCreditoDebito.importe_total), 0)).where(and_(NotaCreditoDebito.cliente_id == id, NotaCreditoDebito.tipo_cuenta == "remito", NotaCreditoDebito.tipo == TipoNota.credito)))
+    nd_rem = await get_sum(select(func.coalesce(func.sum(NotaCreditoDebito.importe_total), 0)).where(and_(NotaCreditoDebito.cliente_id == id, NotaCreditoDebito.tipo_cuenta == "remito", NotaCreditoDebito.tipo == TipoNota.debito)))
+    
+    nc_fac = await get_sum(select(func.coalesce(func.sum(NotaCreditoDebito.importe_total), 0)).where(and_(NotaCreditoDebito.cliente_id == id, NotaCreditoDebito.tipo_cuenta == "factura", NotaCreditoDebito.tipo == TipoNota.credito)))
+    nd_fac = await get_sum(select(func.coalesce(func.sum(NotaCreditoDebito.importe_total), 0)).where(and_(NotaCreditoDebito.cliente_id == id, NotaCreditoDebito.tipo_cuenta == "factura", NotaCreditoDebito.tipo == TipoNota.debito)))
+
+    saldo_remitos = p_rem - pag_rem + nd_rem - nc_rem + float(cliente.deuda_inicial_remito)
+    saldo_facturas = p_fac - pag_fac + nd_fac - nc_fac + float(cliente.deuda_inicial_factura)
+
+    return {
+        "deuda": saldo_remitos + saldo_facturas,
+        "saldo_remitos": saldo_remitos,
+        "saldo_facturas": saldo_facturas,
+        "total_pedidos": p_rem + p_fac,
+        "total_pagos": pag_rem + pag_fac,
+        "deuda_inicial": float(cliente.deuda_inicial),
+    }
+
+
+async def _get_or_create_localidad(db: AsyncSession, nombre: str) -> int | None:
+    nombre = nombre.strip()
+    if not nombre or nombre == "-":
+        return None
+    result = await db.execute(select(Localidad).where(func.lower(Localidad.nombre) == nombre.lower()))
+    localidad = result.scalar_one_or_none()
+    if localidad:
+        return localidad.id
+    new_loc = Localidad(nombre=nombre)
+    db.add(new_loc)
+    await db.flush()
+    return new_loc.id
+
+
+def _map_cliente_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Map a JSON row (from scrapper or direct format) to cliente fields."""
+    nombre = (
+        row.get("nombre")
+        or row.get("c_nombre")
+        or row.get("razon_social")
+        or row.get("c_razonsocial")
+        or ""
+    ).strip()
+
+    if not nombre:
+        return None
+
+    return {
+        "nombre": nombre,
+        "razon_social": (row.get("razon_social") or row.get("c_razonsocial") or "").strip() or None,
+        "cuit": (row.get("cuit") or row.get("c_cuit") or "").strip() or None,
+        "domicilio": (row.get("domicilio") or row.get("c_domicilio") or row.get("direccion") or "-").strip(),
+        "_raw_localidad": (row.get("localidad") or row.get("c_localidad") or row.get("ciudad") or "-").strip(),
+        "telefono": (row.get("telefono") or row.get("c_telefono") or "").strip() or None,
+        "email": (row.get("email") or row.get("c_email") or row.get("mail") or "").strip() or None,
+    }
+
+
+@router.post("/import")
+async def import_clientes(
+    items: list[dict[str, Any]] = Body(...),
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    created = 0
+    updated = 0
+    skipped = 0
+    errors: list[str] = []
+
+    for i, row in enumerate(items):
+        mapped = _map_cliente_row(row)
+        if not mapped or not mapped.get("nombre"):
+            skipped += 1
+            continue
+
+        try:
+            existing_q = select(Cliente).where(Cliente.nombre == mapped["nombre"])
+            if mapped.get("cuit"):
+                existing_q = select(Cliente).where(
+                    (Cliente.nombre == mapped["nombre"]) | (Cliente.cuit == mapped["cuit"])
+                )
+
+            result = await db.execute(existing_q)
+            existing = result.scalar_one_or_none()
+
+            raw_loc = mapped.pop("_raw_localidad", "")
+            localidad_id = await _get_or_create_localidad(db, raw_loc) if raw_loc else None
+            mapped["localidad_id"] = localidad_id
+
+            if existing:
+                for field, value in mapped.items():
+                    if value is not None:
+                        setattr(existing, field, value)
+                existing.activo = True
+                updated += 1
+            else:
+                cliente = Cliente(**mapped)
+                db.add(cliente)
+                created += 1
+        except Exception as e:
+            errors.append(f"Fila {i + 1} ({mapped.get('nombre', '?')}): {str(e)}")
+            skipped += 1
+
+    await db.commit()
+
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "total": len(items),
+        "errors": errors[:20],
+    }
+
+
+async def _get_or_create_vendedor(db: AsyncSession, nombre: str) -> int | None:
+    """Find or create a vendedor (ventas user) by first name. Returns user id."""
+    nombre = nombre.strip()
+    if not nombre or nombre.upper() == "NUEVO":
+        return None
+
+    result = await db.execute(
+        select(User).where(
+            func.lower(User.nombre_completo) == nombre.lower()
+        )
+    )
+    user = result.scalar_one_or_none()
+    if user:
+        return user.id
+
+    username = nombre.lower().replace(" ", "")
+    email = f"{username}@sanalle.com"
+
+    for suffix in ["", "2", "3", "4", "5"]:
+        check_user = await db.execute(
+            select(User).where(
+                (User.username == f"{username}{suffix}") | (User.email == f"{email.split('@')[0]}{suffix}@sanalle.com")
+            )
+        )
+        if not check_user.scalar_one_or_none():
+            username = f"{username}{suffix}"
+            email = f"{email.split('@')[0]}{suffix}@sanalle.com"
+            break
+
+    new_user = User(
+        email=email,
+        username=username,
+        hashed_password=get_password_hash("ventas123"),
+        nombre_completo=nombre,
+        rol=RolUsuario.ventas,
+        activo=True,
+    )
+    db.add(new_user)
+    await db.flush()
+    return new_user.id
+
+
+@router.post("/import-xlsx")
+async def import_clientes_xlsx(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    """Import clients from an XLSX file exported from the old system."""
+    import openpyxl
+
+    if not file.filename or not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El archivo debe ser un XLSX",
+        )
+
+    contents = await file.read()
+    wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
+    ws = wb.active
+
+    created = 0
+    updated = 0
+    skipped = 0
+    vendedores_created: list[str] = []
+    errors: list[str] = []
+
+    vendedor_cache: dict[str, int | None] = {}
+    localidad_cache: dict[str, int | None] = {}
+
+    existing_vendedores_result = await db.execute(select(User.nombre_completo).where(User.rol == RolUsuario.ventas))
+    existing_vendedor_names = {row[0].lower() for row in existing_vendedores_result.all()}
+
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    total_client_rows = 0
+
+    for row in rows:
+        if not row or not isinstance(row[0], (int, float)):
+            continue
+        total_client_rows += 1
+
+        try:
+            nombre = str(row[1] or "").strip()
+            if not nombre:
+                skipped += 1
+                continue
+
+            razon_social = str(row[2] or "").strip() or None
+            cuit = str(row[3] or "").strip() or None
+            domicilio = str(row[4] or "").strip() or "-"
+            localidad = str(row[5] or "").strip() or "-"
+            telefono = str(row[6] or "").strip() or None
+            categoria = str(row[7] or "").strip() or None
+            raw_deuda = row[8]
+            deuda_inicial = Decimal(str(raw_deuda)) if raw_deuda and raw_deuda != 0 else Decimal("0")
+            vendedor_nombre = str(row[10] or "").strip()
+
+            vendedor_id = None
+            if vendedor_nombre:
+                if vendedor_nombre not in vendedor_cache:
+                    is_new = vendedor_nombre.lower() not in existing_vendedor_names
+                    vendedor_cache[vendedor_nombre] = await _get_or_create_vendedor(db, vendedor_nombre)
+                    if is_new and vendedor_cache[vendedor_nombre] is not None:
+                        vendedores_created.append(vendedor_nombre)
+                vendedor_id = vendedor_cache[vendedor_nombre]
+
+            localidad_id = None
+            if localidad and localidad != "-":
+                if localidad not in localidad_cache:
+                    localidad_cache[localidad] = await _get_or_create_localidad(db, localidad)
+                localidad_id = localidad_cache[localidad]
+
+            result = await db.execute(
+                select(Cliente).where(Cliente.nombre == nombre)
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                if razon_social:
+                    existing.razon_social = razon_social
+                if cuit:
+                    existing.cuit = cuit
+                existing.domicilio = domicilio
+                if localidad_id:
+                    existing.localidad_id = localidad_id
+                if telefono:
+                    existing.telefono = telefono
+                if categoria:
+                    existing.categoria = categoria
+                if vendedor_id:
+                    existing.vendedor_id = vendedor_id
+                existing.deuda_inicial = deuda_inicial
+                existing.activo = True
+                updated += 1
+            else:
+                cliente = Cliente(
+                    nombre=nombre,
+                    razon_social=razon_social,
+                    cuit=cuit,
+                    domicilio=domicilio,
+                    localidad_id=localidad_id,
+                    telefono=telefono,
+                    categoria=categoria,
+                    vendedor_id=vendedor_id,
+                    deuda_inicial=deuda_inicial,
+                )
+                db.add(cliente)
+                created += 1
+
+        except Exception as e:
+            errors.append(f"Fila ({row[1]}): {str(e)}")
+            skipped += 1
+
+    await db.commit()
+    wb.close()
+
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "total": total_client_rows,
+        "vendedores_created": list(set(vendedores_created)),
+        "errors": errors[:20],
+    }

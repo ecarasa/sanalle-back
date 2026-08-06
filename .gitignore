@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+*.egg
+.mypy_cache/
+.pytest_cache/
+
+# Entornos
+.venv/
+venv/
+env/
+
+# Secretos
+.env
+.env.local
+.env.production
+.env.deploy
+
+# Recibos generados
+storage/recibos/*.pdf
+
+.DS_Store
