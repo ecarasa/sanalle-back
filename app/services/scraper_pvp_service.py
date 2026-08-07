@@ -31,8 +31,10 @@ async def _scrape_productos(result: dict) -> None:
             timeout=settings.PVP_SCRAPER_TIMEOUT,
             headers={"User-Agent": "Mozilla/5.0 (compatible; SanalleBot/1.0)"},
         ) as client:
+            items = result.setdefault("items", [])
             batch = 0
             for producto in productos:
+                old_price = producto.pvp
                 new_price = await _fetch_pvp(
                     client, producto.url_pvp, producto.presentacion,
                     producto.pvp_descripcion, producto.nombre,
@@ -40,10 +42,19 @@ async def _scrape_productos(result: dict) -> None:
 
                 if new_price is None:
                     result["failed"] += 1
+                    items.append({
+                        "producto_id": producto.id, "resultado": "failed",
+                        "pvp_anterior": old_price, "pvp_traido": None,
+                        "detalle": "No se encontró/matcheó el precio en alfabeta",
+                    })
                     continue
 
-                if producto.pvp is not None and new_price == producto.pvp:
+                if old_price is not None and new_price == old_price:
                     result["skipped"] += 1
+                    items.append({
+                        "producto_id": producto.id, "resultado": "skipped",
+                        "pvp_anterior": old_price, "pvp_traido": new_price, "detalle": None,
+                    })
                     continue
 
                 producto.pvp = new_price
@@ -52,6 +63,10 @@ async def _scrape_productos(result: dict) -> None:
                 aplicar_a_producto(producto)
 
                 result["updated"] += 1
+                items.append({
+                    "producto_id": producto.id, "resultado": "updated",
+                    "pvp_anterior": old_price, "pvp_traido": new_price, "detalle": None,
+                })
                 batch += 1
 
                 if batch >= 50:
@@ -80,10 +95,11 @@ async def run_pvp_scrape(origen: str = "manual") -> dict:
         error_message = str(exc)[:500]
         logger.exception("PVP scrape failed")
 
-    # Registrar la corrida en su propia sesión (no debe tumbar el scrape si falla).
+    # Registrar la corrida + el detalle por producto (no debe tumbar el scrape si falla).
     try:
+        from app.models.scraper_run_item import ScraperRunItem
         async with async_session_maker() as log_session:
-            log_session.add(ScraperRun(
+            run = ScraperRun(
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc),
                 duration_seconds=round(time.monotonic() - t0, 2),
@@ -94,8 +110,25 @@ async def run_pvp_scrape(origen: str = "manual") -> dict:
                 skipped=result["skipped"],
                 failed=result["failed"],
                 error_message=error_message,
-            ))
+            )
+            log_session.add(run)
             await log_session.commit()
+            await log_session.refresh(run)
+
+            items = result.get("items", [])
+            if items:
+                log_session.add_all([
+                    ScraperRunItem(
+                        run_id=run.id,
+                        producto_id=it["producto_id"],
+                        resultado=it["resultado"],
+                        pvp_anterior=it["pvp_anterior"],
+                        pvp_traido=it["pvp_traido"],
+                        detalle=it["detalle"],
+                    )
+                    for it in items
+                ])
+                await log_session.commit()
     except Exception:  # noqa: BLE001
         logger.exception("No se pudo registrar la corrida del scraper")
 

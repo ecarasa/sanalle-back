@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.scraper_run import ScraperRun
+from app.models.scraper_run_item import ScraperRunItem
 from app.services.scraper_pvp_service import (
     run_pvp_scrape,
     fetch_pvp_options,
@@ -22,6 +23,34 @@ router = APIRouter()
 @router.post("/trigger-pvp-scrape")
 async def trigger_pvp_scrape(_=Depends(require_role(["admin", "super_admin"]))):
     return await run_pvp_scrape(origen="manual")
+
+
+@router.get("/producto/{producto_id}/log")
+async def scrape_log_producto(
+    producto_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_role(["admin", "super_admin"])),
+):
+    """Log completo del scraper para un producto: cada chequeo, aunque el precio no cambie."""
+    rows = await db.execute(
+        select(ScraperRunItem, ScraperRun.started_at, ScraperRun.trigger)
+        .join(ScraperRun, ScraperRun.id == ScraperRunItem.run_id)
+        .where(ScraperRunItem.producto_id == producto_id)
+        .order_by(ScraperRun.started_at.desc())
+        .limit(limit)
+    )
+    out = []
+    for item, started_at, trigger in rows.all():
+        out.append({
+            "fecha": started_at.isoformat() if started_at else None,
+            "trigger": trigger,
+            "resultado": item.resultado,
+            "pvp_anterior": float(item.pvp_anterior) if item.pvp_anterior is not None else None,
+            "pvp_traido": float(item.pvp_traido) if item.pvp_traido is not None else None,
+            "detalle": item.detalle,
+        })
+    return out
 
 
 @router.get("/runs")
