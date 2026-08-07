@@ -15,6 +15,7 @@ def setup_scheduler() -> None:
             minute=0,
             timezone="America/Argentina/Buenos_Aires",
         ),
+        kwargs={"origen": "scheduled"},
         id="pvp_weekly_scrape",
         name="Actualización semanal de PVP (alfabeta.net)",
         replace_existing=True,

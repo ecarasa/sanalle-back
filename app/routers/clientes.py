@@ -3,12 +3,15 @@ import io
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, update as sa_update
+from pydantic import BaseModel
 from app.core.database import get_db
 from app.core.security import get_password_hash
 from app.models.cliente import Cliente
 from app.models.pedido import Pedido, EstadoDespacho
 from app.models.pago import Pago, EstadoPago
+from app.models.nota_credito_debito import NotaCreditoDebito
+from app.models.solicitud_cambio_cliente import SolicitudCambioCliente
 from app.models.user import User, RolUsuario
 from app.models.localidad import Localidad
 from app.models.zona import Zona
@@ -388,6 +391,80 @@ async def delete_cliente(
     cliente.activo = False
     await db.commit()
     return {"message": f"Cliente {cliente.nombre} desactivado"}
+
+
+# --- Unificación (merge) de clientes duplicados ---
+
+_MERGE_MODELS = (
+    (Pedido, "pedidos"),
+    (Pago, "pagos"),
+    (NotaCreditoDebito, "notas"),
+    (SolicitudCambioCliente, "solicitudes"),
+)
+
+
+class MergeClientesRequest(BaseModel):
+    origen_id: int   # se absorbe y se elimina
+    destino_id: int  # se conserva
+
+
+@router.get("/{id}/asociados")
+async def contar_asociados_cliente(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    """Cuenta registros asociados a un cliente (para previsualizar una unificación)."""
+    cliente = (await db.execute(select(Cliente).where(Cliente.id == id))).scalar_one_or_none()
+    if cliente is None:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    counts = {}
+    for model, label in _MERGE_MODELS:
+        counts[label] = (
+            await db.execute(select(func.count()).where(model.cliente_id == id))
+        ).scalar_one()
+    return {"cliente_id": id, "nombre": cliente.nombre, "asociados": counts}
+
+
+@router.post("/merge")
+async def merge_clientes(
+    body: MergeClientesRequest,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    """Unifica dos clientes: mueve todo lo asociado del ORIGEN al DESTINO y elimina el origen."""
+    if body.origen_id == body.destino_id:
+        raise HTTPException(status_code=400, detail="Origen y destino no pueden ser el mismo cliente")
+
+    origen = (await db.execute(select(Cliente).where(Cliente.id == body.origen_id))).scalar_one_or_none()
+    destino = (await db.execute(select(Cliente).where(Cliente.id == body.destino_id))).scalar_one_or_none()
+    if origen is None or destino is None:
+        raise HTTPException(status_code=404, detail="Cliente origen o destino no encontrado")
+
+    # Reasignar todas las tablas asociadas del origen al destino
+    movidos = {}
+    for model, label in _MERGE_MODELS:
+        res = await db.execute(
+            sa_update(model).where(model.cliente_id == body.origen_id).values(cliente_id=body.destino_id)
+        )
+        movidos[label] = res.rowcount
+
+    # Absorber la deuda inicial del origen en el destino
+    destino.deuda_inicial = (destino.deuda_inicial or Decimal(0)) + (origen.deuda_inicial or Decimal(0))
+    destino.deuda_inicial_remito = (destino.deuda_inicial_remito or Decimal(0)) + (origen.deuda_inicial_remito or Decimal(0))
+    destino.deuda_inicial_factura = (destino.deuda_inicial_factura or Decimal(0)) + (origen.deuda_inicial_factura or Decimal(0))
+
+    origen_nombre = origen.nombre
+    await db.delete(origen)
+    await db.commit()
+
+    return {
+        "origen_id": body.origen_id,
+        "origen_nombre": origen_nombre,
+        "destino_id": body.destino_id,
+        "destino_nombre": destino.nombre,
+        "movidos": movidos,
+    }
 
 
 @router.get("/{id}/deuda")

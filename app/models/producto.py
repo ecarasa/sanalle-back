@@ -86,6 +86,7 @@ class Producto(Base):
     proveedor: Mapped["Proveedor"] = relationship("Proveedor", lazy="noload")  # noqa: F821
     laboratorio: Mapped["Laboratorio"] = relationship("Laboratorio", lazy="noload")  # noqa: F821
     historial_pvp: Mapped[list["HistorialPvpProducto"]] = relationship("HistorialPvpProducto", back_populates="producto", cascade="all, delete-orphan")  # noqa: F821
+    stocks_deposito: Mapped[list["StockProductoDeposito"]] = relationship("StockProductoDeposito", cascade="all, delete-orphan", lazy="selectin")  # noqa: F821
 
 
     # Helpers matematicos para stock fraccionario
@@ -175,3 +176,40 @@ def pvp_initial_history_listener(mapper, connection, target):
                 fecha_cambio=datetime.now()
             )
         )
+
+
+# --- Dual-write: sincroniza el stock por depósito (tabla nueva) cuando cambia A/B ---
+
+_STOCK_FIELDS = ("stock_a_cajas", "stock_a_blisters", "stock_b_cajas", "stock_b_blisters")
+
+
+def _sync_stock_deposito(connection, target):
+    """Upsert de los depósitos legacy (a/b) con el stock actual A/B del producto."""
+    from sqlalchemy import text
+    for legacy, cajas, blisters in (
+        ("a", target.stock_a_cajas, target.stock_a_blisters),
+        ("b", target.stock_b_cajas, target.stock_b_blisters),
+    ):
+        connection.execute(
+            text(
+                """
+                INSERT INTO stock_producto_deposito (producto_id, deposito_id, cajas, blisters)
+                SELECT :pid, d.id, :cajas, :blisters FROM depositos d WHERE d.stock_legacy = :legacy
+                ON CONFLICT (producto_id, deposito_id)
+                DO UPDATE SET cajas = EXCLUDED.cajas, blisters = EXCLUDED.blisters
+                """
+            ),
+            {"pid": target.id, "cajas": cajas, "blisters": blisters, "legacy": legacy},
+        )
+
+
+@event.listens_for(Producto, "before_update")
+def sync_stock_deposito_on_update(mapper, connection, target):
+    state = inspect(target)
+    if any(state.get_history(f, True).has_changes() for f in _STOCK_FIELDS):
+        _sync_stock_deposito(connection, target)
+
+
+@event.listens_for(Producto, "after_insert")
+def sync_stock_deposito_on_insert(mapper, connection, target):
+    _sync_stock_deposito(connection, target)

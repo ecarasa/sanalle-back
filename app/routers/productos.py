@@ -34,11 +34,30 @@ from datetime import datetime, timezone
 from app.utils.filters import apply_column_filters
 
 
+def _stocks_por_deposito(p: Producto) -> list[dict]:
+    """Stock del producto por depósito (ordenado), desde la tabla nueva."""
+    stocks = getattr(p, "stocks_deposito", None) or []
+    rows = [
+        {
+            "deposito_id": s.deposito_id,
+            "nombre": s.deposito.nombre if s.deposito else None,
+            "orden": s.deposito.orden if s.deposito else 0,
+            "activo": s.deposito.activo if s.deposito else True,
+            "cajas": s.cajas,
+            "blisters": s.blisters,
+        }
+        for s in stocks
+    ]
+    rows.sort(key=lambda r: (r["orden"], r["deposito_id"]))
+    return rows
+
+
 def _producto_to_response(p: Producto) -> dict:
     """Build response dict with relationship names and computed fields."""
     d = ProductoResponse.model_validate(p).model_dump()
     d["proveedor_nombre"] = p.proveedor.nombre if p.proveedor else None
     d["laboratorio_nombre"] = p.laboratorio.nombre if p.laboratorio else None
+    d["stocks"] = _stocks_por_deposito(p)
     return d
 
 
@@ -670,7 +689,35 @@ async def operacion_stock(
             producto.stock_b_cajas -= 1
             producto.stock_b_blisters += per_caja
     elif req.tipo_operacion in ['ADJUST', 'MANUAL']:
-        if req.origen == 'STOCK_A':
+        if req.deposito_id is not None:
+            # Ajuste por depósito (soporta depósitos nuevos, no solo A/B)
+            from app.models.deposito import Deposito
+            from app.models.stock_producto_deposito import StockProductoDeposito
+            dep = (await db.execute(select(Deposito).where(Deposito.id == req.deposito_id))).scalar_one_or_none()
+            if dep is None:
+                raise HTTPException(status_code=404, detail="Depósito no encontrado")
+            if dep.stock_legacy == 'a':
+                producto.stock_a_cajas += req.cantidad_cajas
+                producto.stock_a_blisters += req.cantidad_blisters
+            elif dep.stock_legacy == 'b':
+                producto.stock_b_cajas += req.cantidad_cajas
+                producto.stock_b_blisters += req.cantidad_blisters
+            else:
+                # Depósito nuevo: escribe directo en la tabla por depósito
+                row = (await db.execute(
+                    select(StockProductoDeposito).where(
+                        StockProductoDeposito.producto_id == producto.id,
+                        StockProductoDeposito.deposito_id == dep.id,
+                    )
+                )).scalar_one_or_none()
+                if row is None:
+                    row = StockProductoDeposito(producto_id=producto.id, deposito_id=dep.id, cajas=0, blisters=0)
+                    db.add(row)
+                row.cajas += req.cantidad_cajas
+                row.blisters += req.cantidad_blisters
+                if row.cajas < 0 or row.blisters < 0:
+                    raise HTTPException(status_code=400, detail="La operación resultaría en stock negativo")
+        elif req.origen == 'STOCK_A':
             producto.stock_a_cajas += req.cantidad_cajas
             producto.stock_a_blisters += req.cantidad_blisters
         else:

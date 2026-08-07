@@ -8,7 +8,7 @@ from app.routers import (
     tipo_iva, proveedores,
     bancos, localidades,
     notas_credito_debito, ingresos_mercaderia, cuenta_corriente, solicitudes_cambio,
-    zonas, pagos_proveedor, cuenta_sanalle, movimientos_stock, laboratorios,
+    zonas, pagos_proveedor, cuenta_sanalle, movimientos_stock, laboratorios, depositos,
     feature_flags,
 )
 from app.routers import scraper
@@ -80,6 +80,7 @@ app.include_router(pagos_proveedor.router, prefix="/api/v1/pagos-proveedor", tag
 app.include_router(cuenta_sanalle.router, prefix="/api/v1/cuenta-sanalle", tags=["CuentaSanalle"])
 app.include_router(movimientos_stock.router, prefix="/api/v1/movimientos-stock", tags=["MovimientosStock"])
 app.include_router(laboratorios.router, prefix="/api/v1/laboratorios", tags=["Laboratorios"])
+app.include_router(depositos.router, prefix="/api/v1/depositos", tags=["Depositos"])
 app.include_router(scraper.router, prefix="/api/v1/scraper", tags=["Scraper"])
 app.include_router(feature_flags.router, prefix="/api/v1/feature-flags", tags=["FeatureFlags"])
 

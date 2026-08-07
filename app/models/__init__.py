@@ -22,6 +22,9 @@ from app.models.laboratorios import Laboratorio
 from app.models.historial_pvp_producto import HistorialPvpProducto
 from app.models.bitacora_pedido import BitacoraPedido
 from app.models.feature_flag import FeatureFlag
+from app.models.scraper_run import ScraperRun
+from app.models.deposito import Deposito
+from app.models.stock_producto_deposito import StockProductoDeposito
 
 __all__ = [
     "User",
@@ -50,4 +53,7 @@ __all__ = [
     "HistorialPvpProducto",
     "BitacoraPedido",
     "FeatureFlag",
+    "ScraperRun",
+    "Deposito",
+    "StockProductoDeposito",
 ]
