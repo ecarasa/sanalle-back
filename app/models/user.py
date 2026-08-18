@@ -12,6 +12,7 @@ class RolUsuario(enum.Enum):
     admin = "admin"
     ventas = "ventas"
     repartidor = "repartidor"
+    operaciones = "operaciones"
 
 
 

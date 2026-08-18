@@ -1,5 +1,27 @@
 from datetime import date
 
+# Umbrales (en días) del semáforo de ACTIVIDAD por recencia de compra.
+# verde  = compró hace <= VERDE_DIAS (da continuidad)
+# amarillo = compró hace poco, entre VERDE_DIAS y AMARILLO_DIAS
+# rojo   = inactivo (> AMARILLO_DIAS) o nunca compró
+ACTIVIDAD_VERDE_DIAS = 30
+ACTIVIDAD_AMARILLO_DIAS = 90
+
+
+def calcular_semaforo_actividad(dias_ultima_compra: int | None) -> str:
+    """Semáforo de actividad comercial según los días desde la última compra.
+
+    Returns: 'verde', 'amarillo' o 'rojo'.
+    None (nunca compró) => 'rojo' (inactivo).
+    """
+    if dias_ultima_compra is None:
+        return "rojo"
+    if dias_ultima_compra <= ACTIVIDAD_VERDE_DIAS:
+        return "verde"
+    if dias_ultima_compra <= ACTIVIDAD_AMARILLO_DIAS:
+        return "amarillo"
+    return "rojo"
+
 
 def calcular_semaforo(deuda: float, days_overdue: int | None) -> str:
     """Calculate client traffic light based on the age of the oldest unpaid debt.

@@ -21,6 +21,10 @@ class PagoProveedor(Base):
     pago_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("pagos.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Cuenta de dinero de la empresa desde la que sale este pago.
+    cuenta_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("cuentas.id"), nullable=True, index=True
+    )
     importe: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     fecha_pago: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     tipo_pago: Mapped[TipoPago] = mapped_column(

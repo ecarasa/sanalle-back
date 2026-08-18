@@ -20,6 +20,7 @@ class PagoProveedorBase(BaseModel):
     fecha_pago: datetime
     tipo_pago: str
     tipo_cuenta: str = "remito"
+    cuenta_id: Optional[int] = None  # cuenta de la empresa desde donde sale la plata
     referencia_pago: Optional[str] = None
     observacion: Optional[str] = None
 

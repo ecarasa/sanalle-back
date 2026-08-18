@@ -43,6 +43,7 @@ CAMPOS_PEDIDO_AUDITADOS: tuple[str, ...] = (
 CAMPOS_ITEM_AUDITADOS: tuple[str, ...] = (
     "cantidad_cajas",
     "cantidad_blisters",
+    "unidad_venta",
     "precio_unitario",
     "precio_lista",
     "descuento_porcentaje",

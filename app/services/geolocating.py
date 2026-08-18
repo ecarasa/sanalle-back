@@ -64,6 +64,44 @@ async def obtener_coordenadas_tomtom(direccion: str, ciudad: str = "") -> tuple[
     return None, None
 
 
+async def obtener_ruta_osrm(coordenadas_ordenadas: list[tuple[float, float]]) -> dict:
+    """Ruta real vía OSRM (servidor público gratuito, SIN API key).
+
+    Recibe una lista de tuplas (latitud, longitud) ya ordenadas y devuelve el
+    MISMO shape que `obtener_ruta_tomtom` (coords en [lat, lon] para Leaflet).
+    """
+    # OSRM espera lon,lat (coma) y los pares separados por ';'
+    coords_str = ";".join(f"{lon},{lat}" for lat, lon in coordenadas_ordenadas)
+    url = f"https://router.project-osrm.org/route/v1/driving/{coords_str}"
+    params = {"overview": "full", "geometries": "geojson", "steps": "false"}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, params=params, timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("code") != "Ok" or not data.get("routes"):
+            raise ValueError("OSRM no devolvió una ruta válida")
+
+        route = data["routes"][0]
+        # geometry.coordinates viene como [lon, lat] -> pasamos a [lat, lon] para Leaflet
+        coords = [[pt[1], pt[0]] for pt in route["geometry"]["coordinates"]]
+        tramos = [
+            {
+                "distancia_km": leg.get("distance", 0) / 1000.0,
+                "tiempo_minutos": leg.get("duration", 0) / 60.0,
+            }
+            for leg in route.get("legs", [])
+        ]
+
+        return {
+            "coords": coords,
+            "km": route.get("distance", 0) / 1000.0,
+            "tiempo_minutos": route.get("duration", 0) / 60.0,
+            "tramos": tramos,
+        }
+
+
 async def obtener_ruta_tomtom(coordenadas_ordenadas: list[tuple[float, float]]) -> dict:
     """
     Recibe una lista de tuplas (latitud, longitud) ya ordenadas lógicamente.

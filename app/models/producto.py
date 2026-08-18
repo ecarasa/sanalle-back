@@ -39,6 +39,12 @@ class Producto(Base):
 
     status: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # Formato de venta: en qué unidades se puede vender este producto.
+    # Ej. azitromicina cargada como expendedor pero vendida SOLO por blíster:
+    # vende_caja=False, vende_blister=True. Default: solo caja (comportamiento actual).
+    vende_caja: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    vende_blister: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    vende_comprimido: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
     pvp: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     fecha_act_pvp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

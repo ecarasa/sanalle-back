@@ -76,6 +76,8 @@ class NotaCreditoItem(Base):
     descripcion: Mapped[str] = mapped_column(String(500), nullable=False)
     cantidad_cajas: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     cantidad_blisters: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Unidad de venta original de la línea del pedido ('caja' | 'blister').
+    unidad_venta: Mapped[str] = mapped_column(String(20), default="caja", server_default="caja", nullable=False)
     precio_unitario: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     precio_total: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
 

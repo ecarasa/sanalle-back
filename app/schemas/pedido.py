@@ -10,7 +10,10 @@ class PedidoItemBase(BaseModel):
     producto_id: int
     cantidad_cajas: int = Field(0, ge=0)
     cantidad_blisters: int = Field(0, ge=0)
-    cantidad: Optional[int] = None  # Generic quantity (mapped to cajas)
+    cantidad: Optional[int] = None  # Generic quantity (mapped to the sale unit)
+    # Unidad de venta de la línea: 'caja' (default) | 'blister'. Define cómo se
+    # interpreta `cantidad` y en qué unidad se descuenta el stock.
+    unidad_venta: str = "caja"
     precio_lista: Optional[float] = None
     descuento_porcentaje: Optional[float] = None
     precio_unitario: float
@@ -24,6 +27,8 @@ class PedidoItemCreate(PedidoItemBase):
 class PedidoItemResponse(PedidoItemBase):
     id: int
     producto_nombre: Optional[str] = None
+    presentacion: Optional[str] = None
+    blisters_por_caja: Optional[int] = None
     margen: Optional[float] = None  # computed: (precio_unitario - costo_mas_iibb) / precio_unitario * 100
     # Precios de venta del producto por lista, para que el form pueda recalcular al
     # cambiar de lista o de formato sin volver a pedir el producto.
@@ -39,6 +44,7 @@ class PedidoBase(BaseModel):
     tipo_documento: Optional[str] = None
     saldo_pendiente: Optional[float] = None
     transporte: Optional[str] = None
+    direccion_entrega: Optional[str] = None  # envío: por defecto el domicilio del cliente, editable
     fecha_compromiso_pago: Optional[date] = None
     despachado: bool = False
     sociedad: Optional[str] = None  # "sanalle" | "farmacare"
@@ -54,10 +60,12 @@ class PedidoCreate(PedidoBase):
 class PedidoUpdate(BaseModel):
     shipping_status: Optional[str] = None
     payment_status: Optional[str] = None
+    fecha: Optional[date] = None  # fecha de creación (editable)
     fecha_entrega: Optional[date] = None
     observacion: Optional[str] = None
     tipo_documento: Optional[str] = None
     transporte: Optional[str] = None
+    direccion_entrega: Optional[str] = None
     fecha_compromiso_pago: Optional[date] = None
     despachado: Optional[bool] = None
     sociedad: Optional[str] = None
@@ -109,6 +117,8 @@ class PedidoResponse(BaseModel):
     cliente_domicilio: Optional[str] = None
     cliente_telefono: Optional[str] = None
     cliente_localidad: Optional[str] = None
+    cliente_codigo_postal: Optional[str] = None
+    cliente_provincia: Optional[str] = None
     cliente_zona: Optional[str] = None
     repartidor_id: Optional[int] = None
     repartidor_nombre: Optional[str] = None
@@ -136,6 +146,16 @@ class Coordenada(BaseModel):
 class OptimizarRutaRequest(BaseModel):
     coordenadas: list[Coordenada]
     pedidos_ids: list[int]
+    fecha: Optional[date] = None  # fecha de entrega real de la ruta (para la caché)
+
+
+class DespacharRutaRequest(BaseModel):
+    pedido_ids: list[int]
+
+
+class HojaRutaRequest(BaseModel):
+    pedido_ids: list[int]  # en el orden óptimo de paradas
+    fecha: Optional[date] = None
 
 class TramoRuta(BaseModel):
     distancia_km: float
@@ -147,4 +167,4 @@ class OptimizarRutaResponse(BaseModel):
     km: float
     tiempo_minutos: float
     waypoints: list[int]  # Indice original ordenado
-    tramos: List[TramoRuta]
+    tramos: list[TramoRuta]

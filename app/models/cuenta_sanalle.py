@@ -25,6 +25,9 @@ class CategoriaMovimiento(enum.Enum):
     transferencia_recibida = "transferencia_recibida"
     cheque_recibido = "cheque_recibido"
     compra_mercaderia = "compra_mercaderia"
+    # Pasamanos: plata de un cliente que entra sólo para salir a un proveedor.
+    # No es caja propia; se excluye de los totales reales de ingresos/egresos.
+    transito = "transito"
     otro = "otro"
 
 

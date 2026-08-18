@@ -70,6 +70,12 @@ async def list_productos(
     column_filters: str | None = Query(None, alias="filters", description="JSON column filters"),
     proveedor_id: int | None = Query(None),
     laboratorio_id: int | None = Query(None),
+    sort_by: str = Query("nombre", description="Campo de orden: nombre, codigo, created_at, pvp"),
+    sort_dir: str = Query("asc", pattern="^(asc|desc)$"),
+    solo_nuevos: bool = Query(False, description="Solo productos cargados recientemente"),
+    nuevos_dias: int = Query(30, ge=1, le=365, description="Ventana de días para 'producto nuevo'"),
+    sin_pvp: bool = Query(False, description="Solo productos sin PVP cargado"),
+    all: bool = Query(False, description="Devolver todos los productos sin paginar (para grilla en memoria)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -91,6 +97,15 @@ async def list_productos(
 
     if laboratorio_id:
         filters.append(Producto.laboratorio_id == laboratorio_id)
+
+    # Herramienta comercial: productos nuevos (cargados en los últimos N días).
+    if solo_nuevos:
+        from datetime import datetime, timedelta
+        filters.append(Producto.created_at >= datetime.now() - timedelta(days=nuevos_dias))
+
+    # Trabajo de carga de precios: productos sin PVP.
+    if sin_pvp:
+        filters.append(Producto.pvp.is_(None))
 
     where_clause = and_(*filters) if filters else True
 
@@ -118,49 +133,59 @@ async def list_productos(
     total_result = await db.execute(count_query)
     total = total_result.scalar_one()
 
+    # Orden configurable. "codigo" y "created_at" permiten ver el último producto
+    # cargado (created_at desc) o recorrer los códigos en orden.
+    _SORT_COLUMNS = {
+        "id": Producto.id,
+        "nombre": Producto.nombre,
+        "codigo": Producto.codigo,
+        "created_at": Producto.created_at,
+        "pvp": Producto.pvp,
+        "presentacion": Producto.presentacion,
+        "categoria_producto": Producto.categoria_producto,
+        "status": Producto.status,
+        "stock_a_cajas": Producto.stock_a_cajas,
+        "stock_b_cajas": Producto.stock_b_cajas,
+    }
+    sort_col = _SORT_COLUMNS.get(sort_by, Producto.nombre)
+    order_expr = sort_col.desc() if sort_dir == "desc" else sort_col.asc()
+
     query = (
         base_query
         .options(
             selectinload(Producto.proveedor),
             selectinload(Producto.laboratorio)
         )
-        .order_by(Producto.nombre)
-        .offset((page - 1) * page_size)
-        .limit(page_size)
+        .order_by(order_expr)
     )
+    if not all:
+        query = query.offset((page - 1) * page_size).limit(page_size)
     result = await db.execute(query)
     productos = result.scalars().unique().all()
 
     return {
         "items": [_producto_to_response(p) for p in productos],
         "total": total,
-        "page": page,
-        "page_size": page_size,
+        "page": 1 if all else page,
+        "page_size": total if all else page_size,
     }
 
 
-@router.get("/public")
-async def list_productos_public(
-    search: str = Query("", description="Buscar por nombre o código"),
-    lista: str = Query(
-        "minorista",
-        pattern="^(minorista|mayorista|comercio)$",
-        description="Grupo de lista de precios a exponer",
-    ),
-    laboratorio_id: int | None = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=1, le=100),
-    all: bool = Query(False, description="Devolver todos los productos sin paginar"),
-    db: AsyncSession = Depends(get_db),
-):
-    """Public version of product list for clients.
+async def build_public_catalogo(
+    db: AsyncSession,
+    *,
+    search: str = "",
+    lista: str = "minorista",
+    laboratorio_id: int | None = None,
+    page: int = 1,
+    page_size: int = 25,
+    all: bool = False,
+) -> dict:
+    """Arma el catálogo público (productos activos + precios del grupo `lista`).
 
-    Ordenado alfabeticamente por laboratorio y luego por nombre. Los productos
-    sin laboratorio quedan al final. Con all=true se devuelve el listado completo
-    sin paginar (para la vista agrupada por laboratorio).
-
-    Sólo se exponen los precios del grupo pedido en `lista`: quien abre el catálogo
-    minorista no recibe los precios mayoristas ni los de comercio.
+    Reutilizable por el endpoint abierto `/productos/public` y por el catálogo
+    con token en `/publico/lista/{token}`. Sólo expone los precios del grupo
+    pedido: quien abre el catálogo minorista no recibe mayoristas ni comercio.
     """
     filters = [
         Producto.activo == True,
@@ -214,6 +239,27 @@ async def list_productos_public(
         "page": 1 if all else page,
         "page_size": total if all else page_size,
     }
+
+
+@router.get("/public")
+async def list_productos_public(
+    search: str = Query("", description="Buscar por nombre o código"),
+    lista: str = Query(
+        "minorista",
+        pattern="^(minorista|mayorista|comercio)$",
+        description="Grupo de lista de precios a exponer",
+    ),
+    laboratorio_id: int | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    all: bool = Query(False, description="Devolver todos los productos sin paginar"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public version of product list for clients (abierto, sin token)."""
+    return await build_public_catalogo(
+        db, search=search, lista=lista, laboratorio_id=laboratorio_id,
+        page=page, page_size=page_size, all=all,
+    )
 
 
 @router.get("/import-template")

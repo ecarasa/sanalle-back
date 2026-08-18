@@ -24,7 +24,8 @@ class Cliente(Base):
         Integer, ForeignKey("zonas.id"), nullable=True
     )
     condicion_pago: Mapped[str | None] = mapped_column(String(20), nullable=True)  # contado / plazo
-    plazo_dias: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plazo_dias: Mapped[int | None] = mapped_column(Integer, nullable=True)  # días para el compromiso de pago
+    dias_entrega: Mapped[int | None] = mapped_column(Integer, nullable=True)  # días hasta la fecha de entrega por defecto
     vendedor_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=True, index=True
     )

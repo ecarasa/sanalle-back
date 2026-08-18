@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from functools import partial
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm, cm
@@ -18,7 +19,13 @@ from app.core.config import settings
 BLUE = HexColor("#003087")
 BLUE_DARK = HexColor("#001B5A")
 RED = HexColor("#E31837")
+CELESTE = HexColor("#00AEEF")
 LIGHT_BG = HexColor("#F0F4F8")
+CARD_BORDER = HexColor("#D1D5DB")
+LABEL_GREY = HexColor("#6B7280")
+ROW_ALT = HexColor("#F8FAFC")
+GREEN = HexColor("#15803D")
+AMBER = HexColor("#B45309")
 PAGE_W, PAGE_H = A4
 
 APP_NAME = settings.APP_NAME
@@ -39,9 +46,11 @@ def _draw_page_header_footer(canvas, doc, title_text: str, doc_number: str):
     """Draw consistent header and footer on every page."""
     canvas.saveState()
 
-    # --- Header bar ---
+    # --- Header bar (banda azul + acento celeste) ---
     canvas.setFillColor(BLUE_DARK)
     canvas.rect(0, PAGE_H - 28, PAGE_W, 28, fill=1, stroke=0)
+    canvas.setFillColor(CELESTE)
+    canvas.rect(0, PAGE_H - 31, PAGE_W, 3, fill=1, stroke=0)
     canvas.setFillColor(white)
     canvas.setFont("Helvetica-Bold", 9)
     canvas.drawString(doc.leftMargin, PAGE_H - 20, f"{APP_NAME}")
@@ -60,7 +69,7 @@ def _draw_page_header_footer(canvas, doc, title_text: str, doc_number: str):
 
     canvas.setFillColor(BLUE)
     canvas.setFont("Helvetica", 7)
-    canvas.drawCentredString(PAGE_W / 2, 14, f"{APP_NAME} © 2024  —  Droguería y Distribuidora de Medicamentos")
+    canvas.drawCentredString(PAGE_W / 2, 14, f"{APP_NAME} © {datetime.now().year}  —  Droguería y Distribuidora de Medicamentos")
 
     canvas.restoreState()
 
@@ -435,6 +444,106 @@ def generate_recibo_pdf_sin_valores(pago_data: dict, cliente_data: dict, recepto
 # PEDIDO PDF
 # ---------------------------------------------------------------------------
 
+def _estado_color(estado: str) -> HexColor:
+    """Color del badge según el estado (despacho o pago)."""
+    e = (estado or "").lower()
+    if e in ("entregado", "pagado"):
+        return GREEN
+    if e in ("cancelado",):
+        return RED
+    if e in ("parcial", "pendiente", "en_preparacion"):
+        return AMBER
+    if e in ("en_camino", "listo_para_despacho"):
+        return CELESTE
+    return LABEL_GREY
+
+
+def _estado_badge(texto: str) -> Table:
+    """Chip coloreado (fondo del color del estado, texto blanco)."""
+    color = _estado_color(texto)
+    label = (texto or "-").replace("_", " ").upper()
+    st = ParagraphStyle('_badge', fontName='Helvetica-Bold', fontSize=7.5, textColor=white, alignment=TA_CENTER, leading=9)
+    t = Table([[Paragraph(label, st)]], colWidths=[None])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), color),
+        ('TOPPADDING', (0, 0), (-1, -1), 2),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    return t
+
+
+def _kv_card(title_text: str, kv: list[tuple[str, object]], col_widths: list[float]) -> Table:
+    """Tarjeta con cabecera azul + filas clave/valor (valor puede ser texto o flowable)."""
+    label_st = ParagraphStyle('_lbl', fontName='Helvetica-Bold', fontSize=7, textColor=LABEL_GREY, leading=9)
+    val_st = ParagraphStyle('_val', fontName='Helvetica', fontSize=8.5, textColor=colors.black, leading=11)
+    title_st = ParagraphStyle('_ct', fontName='Helvetica-Bold', fontSize=8.5, textColor=white, leading=11)
+
+    data = [[Paragraph(title_text, title_st), ""]]
+    for k, v in kv:
+        cell = v if hasattr(v, "wrapOn") else Paragraph("" if v is None else str(v), val_st)
+        data.append([Paragraph(k, label_st), cell])
+
+    t = Table(data, colWidths=col_widths)
+    style = [
+        ('SPAN', (0, 0), (1, 0)),
+        ('BACKGROUND', (0, 0), (1, 0), BLUE),
+        ('BOX', (0, 0), (-1, -1), 0.6, CARD_BORDER),
+        ('LINEBELOW', (0, 0), (1, 0), 0.6, BLUE),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('LEFTPADDING', (0, 0), (-1, -1), 7),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 7),
+    ]
+    for i in range(1, len(data)):
+        if i % 2 == 0:
+            style.append(('BACKGROUND', (0, i), (-1, i), ROW_ALT))
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def _build_brand_header(elements: list, content_w: float, badge_title: str, badge_lines: list[str]) -> None:
+    """Encabezado consistente: marca (izq) + credencial en recuadro azul (der) + regla celeste.
+
+    `badge_lines`: la primera línea va destacada (azul, negrita); el resto en gris.
+    """
+    brand_title = ParagraphStyle('_bt', fontName='Helvetica-Bold', fontSize=20, textColor=BLUE, leading=22)
+    brand_sub = ParagraphStyle('_bs', fontName='Helvetica', fontSize=9, textColor=LABEL_GREY, leading=12)
+    badge_tipo = ParagraphStyle('_bti', fontName='Helvetica-Bold', fontSize=13, textColor=white, alignment=TA_CENTER, leading=15)
+    badge_num = ParagraphStyle('_bnu', fontName='Helvetica-Bold', fontSize=11, textColor=BLUE, alignment=TA_CENTER, leading=13)
+    badge_sub = ParagraphStyle('_bfe', fontName='Helvetica', fontSize=8, textColor=LABEL_GREY, alignment=TA_CENTER, leading=11)
+
+    badge_rows = [[Paragraph(badge_title, badge_tipo)]]
+    for i, line in enumerate(badge_lines):
+        badge_rows.append([Paragraph(line, badge_num if i == 0 else badge_sub)])
+    doc_badge = Table(badge_rows, colWidths=[content_w * 0.36])
+    doc_badge.setStyle(TableStyle([
+        ('BOX', (0, 0), (-1, -1), 0.8, BLUE),
+        ('BACKGROUND', (0, 0), (0, 0), BLUE),
+        ('LINEBELOW', (0, 0), (0, 0), 2, CELESTE),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+    ]))
+
+    header_tbl = Table([[
+        [Paragraph(APP_NAME, brand_title), Paragraph("Droguería y Distribuidora de Medicamentos", brand_sub)],
+        doc_badge,
+    ]], colWidths=[content_w * 0.60, content_w * 0.40])
+    header_tbl.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    elements.append(header_tbl)
+    elements.append(Spacer(1, 3 * mm))
+    _rule = Table([['']], colWidths=[content_w], rowHeights=[2])
+    _rule.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, -1), CELESTE)]))
+    elements.append(_rule)
+    elements.append(Spacer(1, 5 * mm))
+
+
 def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: str, items: list[dict]) -> str:
     filename = f"{pedido_data['numero_pedido']}.pdf"
     filepath = os.path.join(settings.PDF_STORAGE_PATH, filename)
@@ -452,36 +561,63 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
     s = _get_styles()
     elements = []
 
-    # --- Company header ---
-    _build_company_header(elements, s, doc_title)
-
-    # --- Pedido info ---
     fecha_str = str(pedido_data.get('fecha', ''))[:10]
     fecha_ent = str(pedido_data.get('fecha_entrega', '') or '-')[:10]
-    shipping = str(pedido_data.get('shipping_status', '')).upper()
-    payment = str(pedido_data.get('payment_status', '')).upper()
+    shipping = str(pedido_data.get('shipping_status', ''))
+    payment = str(pedido_data.get('payment_status', ''))
+    content_w = PAGE_W - doc.leftMargin - doc.rightMargin
 
-    info_data = [
-        [Paragraph('<b>N° Pedido</b>', s["normal"]), Paragraph(doc_number, s["normal"]),
-         Paragraph('<b>Fecha</b>', s["normal"]), Paragraph(fecha_str, s["normal"])],
-        [Paragraph('<b>Cliente</b>', s["normal"]), Paragraph(str(cliente_data.get('nombre', '')), s["normal"]),
-         Paragraph('<b>CUIT</b>', s["normal"]), Paragraph(str(cliente_data.get('cuit', '-')), s["normal"])],
-        [Paragraph('<b>Domicilio</b>', s["normal"]), Paragraph(str(cliente_data.get('domicilio', '')), s["normal"]),
-         Paragraph('<b>Localidad</b>', s["normal"]), Paragraph(str(cliente_data.get('localidad', '')), s["normal"])],
-        [Paragraph('<b>Vendedor</b>', s["normal"]), Paragraph(vendedor_nombre, s["normal"]),
-         Paragraph('<b>Despacho</b>', s["normal"]), Paragraph(shipping, s["normal"])],
-        [Paragraph('<b>Fecha Entrega</b>', s["normal"]), Paragraph(fecha_ent, s["normal"]),
-         Paragraph('<b>Pago</b>', s["normal"]), Paragraph(payment, s["normal"])],
-        [Paragraph('<b>Transporte</b>', s["normal"]), Paragraph(str(pedido_data.get('transporte') or '-'), s["normal"]),
-         Paragraph('', s["normal"]), Paragraph('', s["normal"])],
+    # --- Encabezado: marca (izq) + credencial del comprobante (der) ---
+    _build_brand_header(elements, content_w, tipo_doc, [f"N° {doc_number}", f"Fecha: {fecha_str}"])
+
+    # --- Dos tarjetas: Cliente | Comprobante ---
+    card_w = (content_w - 14) / 2
+    lbl_w = 62
+    inner = [lbl_w, card_w - lbl_w]
+
+    cli_kv: list[tuple[str, object]] = [
+        ("CLIENTE", str(cliente_data.get('nombre', '') or '-')),
+        ("CUIT", str(cliente_data.get('cuit', '') or '-')),
+        ("DOMICILIO", str(cliente_data.get('domicilio', '') or '-')),
+        ("LOCALIDAD", str(cliente_data.get('localidad', '') or '-')),
     ]
-    info_tbl = Table(info_data, colWidths=[75, 160, 75, 160])
-    info_tbl.setStyle(_info_table_style())
-    elements.append(info_tbl)
+    if cliente_data.get('zona'):
+        cli_kv.append(("ZONA", str(cliente_data.get('zona'))))
+    if cliente_data.get('telefono'):
+        cli_kv.append(("TELÉFONO", str(cliente_data.get('telefono'))))
+
+    comp_kv: list[tuple[str, object]] = [
+        ("N° PEDIDO", doc_number),
+        ("FECHA", fecha_str),
+        ("ENTREGA", fecha_ent),
+        ("VENDEDOR", str(vendedor_nombre or '-')),
+        ("TRANSPORTE", str(pedido_data.get('transporte') or '-')),
+        ("DESPACHO", _estado_badge(shipping)),
+        ("PAGO", _estado_badge(payment)),
+    ]
+
+    cards = Table([[
+        _kv_card("DATOS DEL CLIENTE", cli_kv, inner),
+        "",
+        _kv_card("COMPROBANTE", comp_kv, inner),
+    ]], colWidths=[card_w, 14, card_w])
+    cards.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    elements.append(cards)
     elements.append(Spacer(1, 6 * mm))
 
     # --- Products (paginated, header repeats) ---
     elements.append(Paragraph("DETALLE DE PRODUCTOS", s["section"]))
+
+    def _cant_unidad(item: dict) -> str:
+        """Cantidad + unidad de venta (ej. '5 cajas' / '12 blísters')."""
+        cant = item.get('cantidad', 0) or 0
+        label = item.get('unidad_label') or 'caja'
+        plural = f"{label}s" if cant != 1 else label
+        return f"{cant} {plural}"
 
     has_discount = any(item.get('descuento_porcentaje') for item in items)
 
@@ -499,7 +635,7 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
             desc = item.get('descuento_porcentaje')
             rows.append([
                 Paragraph(str(item.get('producto_nombre', '')), s["normal_sm"]),
-                Paragraph(str(item.get('cantidad', 0)), ParagraphStyle('_c', parent=s["normal_sm"], alignment=TA_CENTER)),
+                Paragraph(_cant_unidad(item), ParagraphStyle('_c', parent=s["normal_sm"], alignment=TA_CENTER)),
                 Paragraph(f"$ {float(item.get('precio_lista') or item.get('precio_unitario', 0)):,.2f}", ParagraphStyle('_r', parent=s["normal_sm"], alignment=TA_RIGHT)),
                 Paragraph(f"{float(desc):.1f}%" if desc else "-", ParagraphStyle('_c2', parent=s["normal_sm"], alignment=TA_CENTER)),
                 Paragraph(f"$ {float(item.get('precio_unitario', 0)):,.2f}", ParagraphStyle('_r', parent=s["normal_sm"], alignment=TA_RIGHT)),
@@ -517,7 +653,7 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
         for item in items:
             rows.append([
                 Paragraph(str(item.get('producto_nombre', '')), s["normal_sm"]),
-                Paragraph(str(item.get('cantidad', 0)), ParagraphStyle('_c', parent=s["normal_sm"], alignment=TA_CENTER)),
+                Paragraph(_cant_unidad(item), ParagraphStyle('_c', parent=s["normal_sm"], alignment=TA_CENTER)),
                 Paragraph(f"$ {float(item.get('precio_unitario', 0)):,.2f}", ParagraphStyle('_r', parent=s["normal_sm"], alignment=TA_RIGHT)),
                 Paragraph(f"$ {float(item.get('precio_total', 0)):,.2f}", ParagraphStyle('_r2', parent=s["normal_sm"], alignment=TA_RIGHT)),
             ])
@@ -528,18 +664,124 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
     elements.append(Spacer(1, 4 * mm))
 
     importe_total = float(pedido_data.get('importe_total', 0))
-    elements.append(Paragraph(f"<b>TOTAL: $ {importe_total:,.2f}</b>", s["right_bold"]))
-    elements.append(Spacer(1, 5 * mm))
 
-    # --- Observations ---
+    # --- Total destacado (derecha) + importe en letras ---
+    total_lbl_st = ParagraphStyle('_tl', fontName='Helvetica-Bold', fontSize=11, textColor=white, leading=16)
+    total_val_st = ParagraphStyle('_tv', fontName='Helvetica-Bold', fontSize=15, textColor=white, alignment=TA_RIGHT, leading=18)
+    total_box = Table([[
+        Paragraph("TOTAL", total_lbl_st),
+        Paragraph(f"$ {importe_total:,.2f}", total_val_st),
+    ]], colWidths=[70, 165])
+    total_box.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), BLUE),
+        ('LINEBEFORE', (0, 0), (0, -1), 3, CELESTE),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 7),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
+        ('LEFTPADDING', (0, 0), (-1, -1), 10),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+    ]))
+    total_wrap = Table([["", total_box]], colWidths=[content_w - 235, 235])
+    total_wrap.setStyle(TableStyle([
+        ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('TOPPADDING', (0, 0), (-1, -1), 0), ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    elements.append(total_wrap)
+    elements.append(Spacer(1, 2 * mm))
+    letras_st = ParagraphStyle('_letras', fontName='Helvetica-Oblique', fontSize=8, textColor=LABEL_GREY, alignment=TA_RIGHT, leading=11)
+    elements.append(Paragraph(f"Son: {numero_a_letras(importe_total)}", letras_st))
+    elements.append(Spacer(1, 6 * mm))
+
+    # --- Observaciones (recuadro suave) ---
     obs = pedido_data.get('observacion', '')
     if obs:
-        elements.append(Paragraph("OBSERVACIONES", s["section"]))
-        elements.append(Paragraph(str(obs), s["normal"]))
+        obs_title_st = ParagraphStyle('_obt', fontName='Helvetica-Bold', fontSize=8, textColor=BLUE, leading=11)
+        obs_body_st = ParagraphStyle('_obb', fontName='Helvetica', fontSize=8.5, textColor=colors.black, leading=12)
+        obs_box = Table([
+            [Paragraph("OBSERVACIONES", obs_title_st)],
+            [Paragraph(str(obs), obs_body_st)],
+        ], colWidths=[content_w])
+        obs_box.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), LIGHT_BG),
+            ('BOX', (0, 0), (-1, -1), 0.6, CARD_BORDER),
+            ('LINEBEFORE', (0, 0), (0, -1), 3, CELESTE),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('LEFTPADDING', (0, 0), (-1, -1), 9),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+        ]))
+        elements.append(obs_box)
         elements.append(Spacer(1, 5 * mm))
 
     # Build with per-page header/footer
     on_page = partial(_draw_page_header_footer, title_text=doc_title, doc_number=doc_number)
+    doc.build(elements, onFirstPage=on_page, onLaterPages=on_page)
+    return filename
+
+
+# ---------------------------------------------------------------------------
+# HOJA DE RUTA PDF
+# ---------------------------------------------------------------------------
+
+def generate_hoja_ruta_pdf(fecha: str, paradas: list[dict]) -> str:
+    """Hoja de ruta imprimible: paradas en el orden dado (ya optimizado)."""
+    safe_fecha = (fecha or "sinfecha").replace("-", "").replace(":", "").replace(" ", "")[:12] or "sinfecha"
+    filename = f"HojaRuta_{safe_fecha}.pdf"
+    filepath = os.path.join(settings.PDF_STORAGE_PATH, filename)
+    os.makedirs(settings.PDF_STORAGE_PATH, exist_ok=True)
+
+    doc = SimpleDocTemplate(
+        filepath, pagesize=A4,
+        topMargin=2.2 * cm, bottomMargin=2 * cm,
+        leftMargin=1.6 * cm, rightMargin=1.6 * cm,
+    )
+    s = _get_styles()
+    elements = []
+    title = f"HOJA DE RUTA - {fecha}" if fecha else "HOJA DE RUTA"
+    content_w = PAGE_W - doc.leftMargin - doc.rightMargin
+    total_bultos = sum(int(p.get('bultos', 0) or 0) for p in paradas)
+
+    # --- Encabezado con la credencial de la ruta ---
+    _build_brand_header(
+        elements, content_w, "HOJA DE RUTA",
+        [f"Fecha: {fecha or '-'}", f"{len(paradas)} paradas · {total_bultos} bultos"],
+    )
+
+    header_row = [
+        Paragraph('<b>#</b>', s["header_cell"]),
+        Paragraph('<b>Cliente / Dirección</b>', s["header_cell"]),
+        Paragraph('<b>Bultos</b>', s["header_cell"]),
+        Paragraph('<b>Productos</b>', s["header_cell"]),
+    ]
+    orden_st = ParagraphStyle('_hr_c', parent=s["normal_sm"], alignment=TA_CENTER, fontName='Helvetica-Bold', fontSize=11, textColor=BLUE)
+    bultos_st = ParagraphStyle('_hr_c2', parent=s["normal_sm"], alignment=TA_CENTER, fontName='Helvetica-Bold')
+    cli_st = ParagraphStyle('_hr_cli', parent=s["normal_sm"], leading=12)
+    rows = [header_row]
+    for p in paradas:
+        cliente_dir = f"<b>{p.get('cliente', '')}</b><br/>{p.get('direccion', '')}"
+        loc = p.get('localidad')
+        if loc:
+            cliente_dir += f", {loc}"
+        zona = p.get('zona')
+        if zona:
+            cliente_dir += f'<br/><font color="#00AEEF"><b>Zona: {zona}</b></font>'
+        tel = p.get('telefono')
+        if tel:
+            cliente_dir += f"<br/>Tel: {tel}"
+        items_txt = "<br/>".join(
+            f"{it['cantidad']} {it['unidad']} — {it['producto']}" for it in p.get('items', [])
+        ) or "-"
+        rows.append([
+            Paragraph(str(p.get('orden', '')), orden_st),
+            Paragraph(cliente_dir, cli_st),
+            Paragraph(str(p.get('bultos', 0)), bultos_st),
+            Paragraph(items_txt, s["normal_sm"]),
+        ])
+    tbl = Table(rows, colWidths=[26, 214, 42, 210], repeatRows=1)
+    tbl.setStyle(_product_table_style(len(rows)))
+    elements.append(tbl)
+
+    on_page = partial(_draw_page_header_footer, title_text=title, doc_number="")
     doc.build(elements, onFirstPage=on_page, onLaterPages=on_page)
     return filename
 
@@ -565,10 +807,7 @@ def generate_orden_compra_pdf(ingreso_data: dict, proveedor_data: dict, items: l
     s = _get_styles()
     elements = []
 
-    # --- Company header ---
-    _build_company_header(elements, s, doc_title)
-
-    # --- Main info table ---
+    # --- Datos ---
     fecha_str = str(ingreso_data.get("fecha", ""))[:10]
     num_comprobante = ingreso_data.get("numero_comprobante") or "—"
     destino = ingreso_data.get("destino", "A")
@@ -577,40 +816,51 @@ def generate_orden_compra_pdf(ingreso_data: dict, proveedor_data: dict, items: l
     fecha_vto = ingreso_data.get("fecha_vencimiento")
     fecha_vto_str = str(fecha_vto)[:10] if fecha_vto else "—"
     creado_por = ingreso_data.get("creado_por_nombre") or "—"
+    content_w = PAGE_W - doc.leftMargin - doc.rightMargin
 
-    info_data = [
-        [Paragraph("<b>N° Orden</b>", s["normal"]),    Paragraph(doc_number, s["normal"]),
-         Paragraph("<b>Fecha</b>", s["normal"]),        Paragraph(fecha_str, s["normal"])],
-        [Paragraph("<b>N° Comprobante</b>", s["normal"]), Paragraph(num_comprobante, s["normal"]),
-         Paragraph("<b>Destino</b>", s["normal"]),      Paragraph(destino_label, s["normal"])],
-        [Paragraph("<b>Proveedor</b>", s["normal"]),    Paragraph(proveedor_data.get("nombre") or "—", s["normal"]),
-         Paragraph("<b>Contacto</b>", s["normal"]),     Paragraph(proveedor_data.get("contacto_nombre") or "—", s["normal"])],
-        [Paragraph("<b>Plazo de Pago</b>", s["normal"]), Paragraph(f"{dias_plazo} días" if dias_plazo else "—", s["normal"]),
-         Paragraph("<b>Vencimiento</b>", s["normal"]),  Paragraph(fecha_vto_str, s["normal"])],
-        [Paragraph("<b>Registrado por</b>", s["normal"]), Paragraph(creado_por, s["normal"]),
-         Paragraph("<b>Fecha Registro</b>", s["normal"]), Paragraph(str(ingreso_data.get("created_at", ""))[:10], s["normal"])],
+    # --- Encabezado ---
+    _build_brand_header(elements, content_w, "ORDEN DE COMPRA", [f"N° {doc_number}", f"Fecha: {fecha_str}"])
+
+    # --- Dos tarjetas: Proveedor | Orden ---
+    card_w = (content_w - 14) / 2
+    lbl_w = 74
+    inner = [lbl_w, card_w - lbl_w]
+
+    prov_kv: list[tuple[str, object]] = [
+        ("PROVEEDOR", proveedor_data.get("nombre") or "—"),
+        ("CONTACTO", proveedor_data.get("contacto_nombre") or "—"),
     ]
-    info_tbl = Table(info_data, colWidths=[90, 155, 90, 135])
-    info_tbl.setStyle(_info_table_style())
-    elements.append(info_tbl)
-    elements.append(Spacer(1, 4 * mm))
-
-    # --- Proveedor contact details (if available) ---
-    prov_lines = []
     if proveedor_data.get("direccion"):
-        prov_lines.append(f"Dirección: {proveedor_data['direccion']}")
+        prov_kv.append(("DIRECCIÓN", proveedor_data["direccion"]))
     if proveedor_data.get("telefono"):
-        prov_lines.append(f"Tel.: {proveedor_data['telefono']}")
+        prov_kv.append(("TELÉFONO", proveedor_data["telefono"]))
     if proveedor_data.get("contacto_telefono"):
-        prov_lines.append(f"Tel. Contacto: {proveedor_data['contacto_telefono']}")
+        prov_kv.append(("TEL. CONTACTO", proveedor_data["contacto_telefono"]))
     if proveedor_data.get("contacto_email"):
-        prov_lines.append(f"Email: {proveedor_data['contacto_email']}")
-    if prov_lines:
-        elements.append(Paragraph(
-            "  |  ".join(prov_lines),
-            ParagraphStyle("_prov_sub", parent=s["small"], spaceAfter=4),
-        ))
-    elements.append(Spacer(1, 4 * mm))
+        prov_kv.append(("EMAIL", proveedor_data["contacto_email"]))
+
+    orden_kv: list[tuple[str, object]] = [
+        ("N° ORDEN", doc_number),
+        ("COMPROBANTE", num_comprobante),
+        ("DESTINO", destino_label),
+        ("PLAZO DE PAGO", f"{dias_plazo} días" if dias_plazo else "—"),
+        ("VENCIMIENTO", fecha_vto_str),
+        ("REGISTRÓ", creado_por),
+        ("FECHA REGISTRO", str(ingreso_data.get("created_at", ""))[:10] or "—"),
+    ]
+
+    cards = Table([[
+        _kv_card("DATOS DEL PROVEEDOR", prov_kv, inner),
+        "",
+        _kv_card("ORDEN", orden_kv, inner),
+    ]], colWidths=[card_w, 14, card_w])
+    cards.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    elements.append(cards)
+    elements.append(Spacer(1, 6 * mm))
 
     # --- Items table ---
     elements.append(Paragraph("DETALLE DE PRODUCTOS", s["section"]))

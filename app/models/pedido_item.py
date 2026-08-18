@@ -19,6 +19,9 @@ class PedidoItem(Base):
     )
     cantidad_cajas: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     cantidad_blisters: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Unidad en la que se vendió la línea: 'caja' | 'blister'.
+    # Define la base del precio y en qué unidad se descuenta el stock.
+    unidad_venta: Mapped[str] = mapped_column(String(20), default="caja", server_default="caja", nullable=False)
     precio_lista: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     descuento_porcentaje: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
     precio_unitario: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
@@ -40,6 +43,23 @@ class PedidoItem(Base):
     def cantidad(self) -> int:
         """Alias for cantidad_cajas to maintain compatibility with older code."""
         return self.cantidad_cajas
+
+    @property
+    def cantidad_venta(self) -> int:
+        """Cantidad expresada en la UNIDAD DE VENTA de la línea.
+
+        Para líneas por blíster devuelve `cantidad_blisters` (cantidad_cajas es 0);
+        para caja devuelve `cantidad_cajas`. Es la cantidad "real" a mostrar en
+        respuestas de API, PDF, reportes y hoja de ruta.
+        """
+        if self.unidad_venta == "blister":
+            return self.cantidad_blisters
+        return self.cantidad_cajas
+
+    @property
+    def unidad_label(self) -> str:
+        """Etiqueta corta de la unidad para textos/PDF."""
+        return "blíster" if self.unidad_venta == "blister" else "caja"
 
     def __repr__(self) -> str:
         return f"<PedidoItem(id={self.id}, pedido_id={self.pedido_id}, producto_id={self.producto_id}, cajas={self.cantidad_cajas}, blisters={self.cantidad_blisters})>"

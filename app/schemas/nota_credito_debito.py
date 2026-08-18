@@ -11,6 +11,7 @@ class NotaCreditoItemCreate(BaseModel):
     descripcion: str
     cantidad_cajas: int = 0
     cantidad_blisters: int = 0
+    unidad_venta: str = "caja"
     precio_unitario: float
     precio_total: float
 

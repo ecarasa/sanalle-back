@@ -15,14 +15,17 @@ router = APIRouter()
 @router.get("")
 async def list_tipo_iva(
     page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
+    page_size: int = Query(10, ge=1, le=200),
     search: str = Query("", max_length=100),
+    solo_activos: bool = Query(False, description="Devolver solo los conceptos activos"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     base_query = select(TipoIva)
     if search:
         base_query = base_query.where(TipoIva.nombre.ilike(f"%{search}%"))
+    if solo_activos:
+        base_query = base_query.where(TipoIva.activo == True)  # noqa: E712
 
     count_q = select(func.count()).select_from(base_query.subquery())
     total = (await db.execute(count_q)).scalar_one()

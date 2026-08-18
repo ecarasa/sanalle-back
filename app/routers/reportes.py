@@ -12,6 +12,7 @@ from app.models.pago import Pago, TipoPago
 from app.models.pedido import Pedido, EstadoPago as EstadoPagoPedido
 from app.models.pedido_item import PedidoItem
 from app.models.producto import Producto
+from app.models.historial_pvp_producto import HistorialPvpProducto
 from app.models.ingreso_mercaderia import IngresoMercaderia
 from app.models.user import User, RolUsuario
 from app.schemas.reporte import (
@@ -360,6 +361,7 @@ async def get_calendario_unificado(
 async def get_comisiones_vendedores(
     fecha_desde: date = Query(...),
     fecha_hasta: date = Query(...),
+    vendedor_id: int | None = Query(None, description="Filtrar a un vendedor puntual (solo admin/super_admin)"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role(["super_admin", "admin", "ventas"])),
 ):
@@ -376,7 +378,11 @@ async def get_comisiones_vendedores(
     )
 
     if current_user.rol.value == "ventas":
+        # El vendedor solo ve lo suyo, sin importar el vendedor_id pedido.
         stmt = stmt.where(Pedido.vendedor_id == current_user.id)
+    elif vendedor_id:
+        # Admin/super_admin puede filtrar a un vendedor puntual para unificar sus ventas.
+        stmt = stmt.where(Pedido.vendedor_id == vendedor_id)
 
     result = await db.execute(stmt)
     pedidos = result.scalars().all()
@@ -432,7 +438,7 @@ async def get_comisiones_vendedores(
             pedido_items_detalle.append({
                 "producto_id": item.producto_id,
                 "producto_nombre": item.producto.nombre if item.producto else "Producto Desconocido",
-                "cantidad": item.cantidad_cajas,
+                "cantidad": item.cantidad_venta,
                 "precio_unitario": float(item.precio_unitario),
                 "precio_total": float(item.precio_total),
                 "descuento_porcentaje": float(item.descuento_porcentaje or 0),
@@ -533,3 +539,63 @@ async def get_historial_pvp(
         ))
 
     return response
+
+
+@router.get("/aumentos")
+async def get_aumentos(
+    dias: int = Query(180, ge=1, le=1095, description="Ventana en días hacia atrás"),
+    limit: int = Query(50, ge=1, le=200, description="Máximo de lotes de aumento a devolver"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["super_admin", "admin", "ventas"])),
+):
+    """Cuadro discriminado de aumentos de PVP.
+
+    Reutiliza `historial_pvp_producto`: agrupa los cambios de PVP por día y devuelve,
+    por lote/día, el % promedio de variación y el detalle de productos afectados.
+    Solo cuenta cambios con pvp_anterior (excluye la carga inicial del PVP).
+    """
+    from datetime import timedelta
+
+    desde = datetime.now() - timedelta(days=dias)
+
+    stmt = (
+        select(HistorialPvpProducto, Producto.nombre, Producto.codigo)
+        .join(Producto, HistorialPvpProducto.producto_id == Producto.id)
+        .where(HistorialPvpProducto.fecha_cambio >= desde)
+        .where(HistorialPvpProducto.pvp_anterior.isnot(None))
+        .order_by(HistorialPvpProducto.fecha_cambio.desc())
+    )
+    rows = (await db.execute(stmt)).all()
+
+    grupos: dict[str, dict] = {}
+    for h, nombre, codigo in rows:
+        if not h.pvp_anterior or h.pvp_anterior <= 0:
+            continue
+        variacion = float(((h.pvp_nuevo - h.pvp_anterior) / h.pvp_anterior) * 100)
+        fecha_key = h.fecha_cambio.date().isoformat()
+        grupo = grupos.setdefault(fecha_key, {"fecha": fecha_key, "productos": []})
+        grupo["productos"].append({
+            "producto_id": h.producto_id,
+            "producto_nombre": nombre,
+            "producto_codigo": codigo,
+            "pvp_anterior": float(h.pvp_anterior),
+            "pvp_nuevo": float(h.pvp_nuevo),
+            "variacion_porcentaje": round(variacion, 2),
+        })
+
+    resultado = []
+    for fecha_key in sorted(grupos.keys(), reverse=True)[:limit]:
+        grupo = grupos[fecha_key]
+        variaciones = [p["variacion_porcentaje"] for p in grupo["productos"]]
+        aumentos = [v for v in variaciones if v > 0]
+        resultado.append({
+            "fecha": fecha_key,
+            "cantidad_productos": len(grupo["productos"]),
+            "variacion_promedio": round(sum(variaciones) / len(variaciones), 2) if variaciones else 0,
+            "variacion_promedio_aumentos": round(sum(aumentos) / len(aumentos), 2) if aumentos else 0,
+            "variacion_min": round(min(variaciones), 2) if variaciones else 0,
+            "variacion_max": round(max(variaciones), 2) if variaciones else 0,
+            "productos": grupo["productos"],
+        })
+
+    return resultado

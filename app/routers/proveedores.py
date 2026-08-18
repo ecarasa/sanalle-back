@@ -10,6 +10,7 @@ from app.models.user import User
 from app.models.proveedor import Proveedor
 from app.models.ingreso_mercaderia import IngresoMercaderia
 from app.models.notas_proveedor import NotaProveedor, TipoNota
+from app.models.cashback_proveedor import CashbackProveedor
 from app.models.cuenta_sanalle import CuentaSanalle, TipoMovimiento, CategoriaMovimiento
 from app.models.laboratorios import Laboratorio
 from app.models.pago import Pago, TipoPago, TipoCuenta
@@ -48,11 +49,18 @@ async def _build_proveedor_dict(p: Proveedor, db: AsyncSession) -> dict:
         Decimal("0"),
     )
 
+    cashback_pendiente = (await db.execute(
+        select(func.coalesce(func.sum(CashbackProveedor.importe), 0)).where(
+            and_(CashbackProveedor.proveedor_id == p.id, CashbackProveedor.estado == "pendiente")
+        )
+    )).scalar_one()
+
     p_dict = ProveedorResponse.model_validate(p).model_dump()
     p_dict["saldo_pendiente_total"] = saldo_total
     p_dict["pagos_pendientes"] = [PagoPendienteInfo.model_validate(item).model_dump() for item in pendientes]
     p_dict["notas"] = [NotaProveedorInfo.model_validate(n).model_dump() for n in notas]
     p_dict["total_notas_credito"] = total_notas_credito
+    p_dict["cashback_pendiente"] = Decimal(str(cashback_pendiente))
     return p_dict
 
 
@@ -191,6 +199,22 @@ async def pagar_deuda_proveedor(
 
     total_a_pagar = total_a_pagar.quantize(Decimal("0.01"))
 
+    # Resolver el cobro de cliente que (opcionalmente) financia este pago. Si ese cobro
+    # es un pasamanos (cuenta puente), el egreso se registra como TRÁNSITO y no impacta
+    # la caja real. Validamos que el cobro alcance para cubrir lo que se paga.
+    pago_puente = None
+    if body.pago_id is not None:
+        pago_puente = (await db.execute(select(Pago).where(Pago.id == body.pago_id))).scalar_one_or_none()
+    es_transito = pago_puente is not None and pago_puente.es_puente
+    if es_transito and total_a_pagar > pago_puente.importe + Decimal("0.01"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"El pago (${total_a_pagar}) excede el cobro puente (${pago_puente.importe}). "
+                "En una cuenta puente la salida no puede superar la entrada."
+            ),
+        )
+
     # Check Cuenta Sanalle balance
     ing_q = await db.execute(
         select(func.coalesce(func.sum(CuentaSanalle.importe), 0)).where(
@@ -210,15 +234,19 @@ async def pagar_deuda_proveedor(
             detail=f"Saldo insuficiente en Cuenta Sanalle. Balance disponible: ${balance:,.2f}",
         )
 
-    # Apply payments
+    # Apply payments. Guardamos, por renglón, el monto pagado y si el comprobante quedó
+    # saldado (para inferir cashback total vs parcial).
+    lineas_pago: list[tuple[Decimal, bool]] = []
     for ingreso in ingresos:
         monto = Decimal(str(monto_map[ingreso.id])).quantize(Decimal("0.01"))
         max_monto = (ingreso.saldo_pendiente * factor).quantize(Decimal("0.01"))
         if monto >= max_monto - Decimal("0.01"):
             ingreso.saldo_pendiente = Decimal("0")
+            lineas_pago.append((monto, True))   # saldado -> tasa total
         else:
             saldo_reduction = (monto / factor).quantize(Decimal("0.01")) if factor > 0 else ingreso.saldo_pendiente
             ingreso.saldo_pendiente = max(Decimal("0"), ingreso.saldo_pendiente - saldo_reduction)
+            lineas_pago.append((monto, False))  # queda saldo -> tasa parcial
 
     # Record egress in Cuenta Sanalle
     try:
@@ -229,13 +257,15 @@ async def pagar_deuda_proveedor(
     descripcion = f"Pago a {proveedor.nombre} — {len(ingresos)} comprobante(s)"
     if descuento > 0:
         descripcion += f" (desc. {descuento}%)"
+    if es_transito:
+        descripcion = f"Tránsito (pasamanos) → {descripcion}"
 
     fecha_pago = body.fecha or datetime.now(timezone.utc)
 
     movimiento = await registrar_movimiento(
         db=db,
         tipo=TipoMovimiento.egreso,
-        categoria=CategoriaMovimiento.pago_proveedor,
+        categoria=CategoriaMovimiento.transito if es_transito else CategoriaMovimiento.pago_proveedor,
         importe=total_a_pagar,
         metodo_pago=metodo_enum,
         usuario_id=current_user.id,
@@ -244,36 +274,24 @@ async def pagar_deuda_proveedor(
         fecha=fecha_pago,
     )
 
-    # Create cashback credit note if requested
-    nota_id = None
+    # Cashback: por renglón, tasa total si el comprobante quedó saldado, si no parcial.
+    # NO se emite nota de crédito acá: se acumula (ver /acreditar-cashback).
     cashback_importe = Decimal("0")
-    if body.aplicar_cashback and proveedor.cashback > 0:
-        cashback_importe = (total_a_pagar * proveedor.cashback / Decimal("100")).quantize(Decimal("0.01"))
-        nc_numero = f"NC-PROV-{proveedor_id}-{int(datetime.utcnow().timestamp())}"
-        nota = NotaProveedor(
-            numero=nc_numero,
-            tipo=TipoNota.credito,
-            proveedor_id=proveedor_id,
-            fecha=date.today(),
-            importe_total=cashback_importe,
-            creado_por_id=current_user.id,
-        )
-        db.add(nota)
-        await db.flush()
-        nota_id = nota.id
+    if body.aplicar_cashback:
+        for monto_linea, saldado in lineas_pago:
+            tasa = proveedor.cashback_total if saldado else proveedor.cashback_parcial
+            if tasa and tasa > 0:
+                cashback_importe += (monto_linea * tasa / Decimal("100")).quantize(Decimal("0.01"))
 
-    # Resolve optional pago_id
-    pago_id_resuelto = None
-    if body.pago_id is not None:
-        pago_check = await db.execute(select(Pago).where(Pago.id == body.pago_id))
-        if pago_check.scalar_one_or_none():
-            pago_id_resuelto = body.pago_id
+    # pago_id ya resuelto arriba (pago_puente). Se guarda para trazabilidad del pasamanos.
+    pago_id_resuelto = pago_puente.id if pago_puente is not None else None
 
     # Always create PagoProveedor for full traceability
     pp = PagoProveedor(
         proveedor_id=proveedor_id,
         usuario_id=current_user.id,
         pago_id=pago_id_resuelto,
+        cuenta_id=body.cuenta_id,
         importe=total_a_pagar,
         fecha_pago=fecha_pago,
         tipo_pago=metodo_enum,
@@ -294,6 +312,16 @@ async def pagar_deuda_proveedor(
         )
         db.add(imputacion)
 
+    # Acumular el cashback como pendiente (se acredita después en una sola NC).
+    if cashback_importe > 0:
+        db.add(CashbackProveedor(
+            proveedor_id=proveedor_id,
+            pago_proveedor_id=pp.id,
+            importe=cashback_importe,
+            estado="pendiente",
+            fecha=date.today(),
+        ))
+
     await db.commit()
     await db.refresh(movimiento)
 
@@ -302,8 +330,7 @@ async def pagar_deuda_proveedor(
         "movimiento_id": movimiento.id,
         "ingresos_saldados": [i.id for i in ingresos if i.saldo_pendiente == 0],
         "descuento_aplicado": float(descuento),
-        "nota_credito_id": nota_id,
-        "cashback_importe": float(cashback_importe),
+        "cashback_acumulado": float(cashback_importe),
     }
 
 
@@ -327,6 +354,74 @@ async def get_ingresos_pendientes(
     )
     ingresos = ingresos_res.scalars().all()
     return [PagoPendienteInfo.model_validate(i).model_dump() for i in ingresos]
+
+
+@router.get("/{proveedor_id}/cashback")
+async def list_cashback(
+    proveedor_id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """Historial de cashback acumulado del proveedor (pendiente + acreditado)."""
+    rows = (await db.execute(
+        select(CashbackProveedor).where(CashbackProveedor.proveedor_id == proveedor_id)
+        .order_by(CashbackProveedor.created_at.desc())
+    )).scalars().all()
+    pendiente = sum((r.importe for r in rows if r.estado == "pendiente"), Decimal("0"))
+    return {
+        "pendiente": float(pendiente),
+        "items": [
+            {
+                "id": r.id,
+                "importe": float(r.importe),
+                "estado": r.estado,
+                "fecha": r.fecha.isoformat(),
+                "pago_proveedor_id": r.pago_proveedor_id,
+                "nota_proveedor_id": r.nota_proveedor_id,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/{proveedor_id}/acreditar-cashback")
+async def acreditar_cashback(
+    proveedor_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    """Emite UNA nota de crédito por todo el cashback pendiente y lo marca acreditado."""
+    prov = (await db.execute(select(Proveedor).where(Proveedor.id == proveedor_id))).scalar_one_or_none()
+    if not prov:
+        raise HTTPException(status_code=404, detail="Proveedor no encontrado")
+
+    pendientes = (await db.execute(
+        select(CashbackProveedor).where(
+            and_(CashbackProveedor.proveedor_id == proveedor_id, CashbackProveedor.estado == "pendiente")
+        )
+    )).scalars().all()
+    if not pendientes:
+        raise HTTPException(status_code=400, detail="No hay cashback pendiente para acreditar")
+
+    total = sum((c.importe for c in pendientes), Decimal("0")).quantize(Decimal("0.01"))
+
+    nota = NotaProveedor(
+        numero=f"NC-PROV-{proveedor_id}-{int(datetime.utcnow().timestamp())}",
+        tipo=TipoNota.credito,
+        proveedor_id=proveedor_id,
+        fecha=date.today(),
+        importe_total=total,
+        creado_por_id=current_user.id,
+    )
+    db.add(nota)
+    await db.flush()
+
+    for c in pendientes:
+        c.estado = "acreditado"
+        c.nota_proveedor_id = nota.id
+
+    await db.commit()
+    return {"nota_id": nota.id, "total": float(total), "cantidad": len(pendientes)}
 
 
 @router.delete("/{id}")

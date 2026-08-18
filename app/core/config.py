@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     S3_KEY_PREFIX: str = "uploads/sanalle"
     S3_URL: str = ""
     S3_ENDPOINT_URL: str = ""
-    APP_NAME: str = "SANALLE"
+    APP_NAME: str = "Vitalnova"
     # Nombre del proyecto (compartido con el frontend). Si esta seteado,
     # se usa como nombre de la empresa en PDFs y exports.
     NEXT_PUBLIC_APP_NAME: str = ""

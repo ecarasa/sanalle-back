@@ -1,4 +1,4 @@
-from app.services.geolocating import obtener_ruta_tomtom, obtener_coordenadas_osm, obtener_coordenadas_tomtom
+from app.services.geolocating import obtener_ruta_osrm, obtener_ruta_tomtom, obtener_coordenadas_osm, obtener_coordenadas_tomtom
 from app.models.user import RolUsuario
 import os
 from collections import defaultdict
@@ -35,6 +35,8 @@ from app.schemas.pedido import (
     OptimizarRutaRequest,
     OptimizarRutaResponse,
     UbicacionUpdate,
+    DespacharRutaRequest,
+    HojaRutaRequest,
 )
 from app.models.bitacora_pedido import BitacoraPedido
 from app.schemas.bitacora_pedido import BitacoraPedidoResponse
@@ -47,7 +49,7 @@ from app.services.bitacora_service import (
     snapshot_items,
     snapshot_pedido,
 )
-from app.services.pdf_service import generate_pedido_pdf
+from app.services.pdf_service import generate_pedido_pdf, generate_hoja_ruta_pdf
 from app.services.pago_service import imputar_pagos_a_pedido
 from app.services.pricing_service import LISTAS
 from app.services.semaforo_service import calcular_semaforo_pedido
@@ -83,6 +85,67 @@ async def get_transiciones(
     return {"shipping": SHIPPING_TRANSITIONS, "payment": PAYMENT_TRANSITIONS}
 
 
+# Transiciones de despacho permitidas por rol (además de SHIPPING_TRANSITIONS).
+# Los roles que NO figuran acá (admin, super_admin, ventas) no tienen restricción extra.
+ROLE_SHIPPING_ALLOWED: dict[str, set[tuple[str, str]]] = {
+    "operaciones": {("en_preparacion", "listo_para_despacho")},
+    "repartidor": {
+        ("listo_para_despacho", "en_camino"),
+        ("en_camino", "entregado"),
+    },
+}
+
+
+@router.get("/preparacion")
+async def list_preparacion(
+    search: str = Query("", description="Buscar por numero_pedido o nombre de cliente"),
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["operaciones", "admin", "super_admin"])),
+):
+    """Cola de armado para el rol OPERACIONES: pedidos en `en_preparacion` con su
+    detalle de mercadería, SIN ningún campo de dinero (precios/importes)."""
+    q = (
+        select(Pedido)
+        .join(Cliente, Pedido.cliente_id == Cliente.id)
+        .where(Pedido.shipping_status == EstadoDespacho.en_preparacion)
+        .options(
+            selectinload(Pedido.cliente),
+            selectinload(Pedido.items).selectinload(PedidoItem.producto),
+        )
+        .order_by(Pedido.fecha_entrega.asc().nullslast(), Pedido.id.asc())
+    )
+    if search:
+        like = f"%{search}%"
+        q = q.where(or_(Pedido.numero_pedido.ilike(like), Cliente.nombre.ilike(like)))
+
+    pedidos = (await db.execute(q)).scalars().unique().all()
+
+    items_out = []
+    for p in pedidos:
+        items_out.append({
+            "id": p.id,
+            "numero_pedido": p.numero_pedido,
+            "cliente": p.cliente.nombre if p.cliente else "-",
+            "fecha": p.fecha.isoformat() if p.fecha else None,
+            "fecha_entrega": p.fecha_entrega.isoformat() if p.fecha_entrega else None,
+            "observacion": p.observacion,
+            "items": [
+                {
+                    "producto": it.producto.nombre if it.producto else "-",
+                    "codigo": it.producto.codigo if it.producto else None,
+                    "presentacion": it.producto.presentacion if it.producto else None,
+                    "cantidad": it.cantidad_venta,
+                    "unidad": it.unidad_label,
+                    "cantidad_cajas": it.cantidad_cajas,
+                    "cantidad_blisters": it.cantidad_blisters,
+                }
+                for it in p.items
+            ],
+        })
+
+    return {"items": items_out, "total": len(items_out)}
+
+
 def _comision_para(vendedor: User | None, producto: Producto) -> float:
     """Comisión del vendedor según la categoría del producto (GENERICO / OTC)."""
     if vendedor is None:
@@ -93,6 +156,39 @@ def _comision_para(vendedor: User | None, producto: Producto) -> float:
     if categoria == "OTC":
         return vendedor.comision_otc or 0.0
     return 0.0
+
+
+def _resolver_cantidades(item_data, producto: Producto) -> tuple[int, int, str]:
+    """Resuelve (cajas, blisters, unidad_venta) según el formato de venta de la línea.
+
+    - unidad 'blister': `cantidad` son blísters -> cajas=0, blisters=cantidad.
+      El stock se descuenta en blísters (modify_stock fracciona la caja).
+    - unidad 'caja' (default): comportamiento clásico, `cantidad` son cajas.
+
+    Valida contra los formatos habilitados del producto (vende_caja / vende_blister).
+    """
+    unidad = (getattr(item_data, "unidad_venta", "caja") or "caja").lower()
+    if unidad not in ("caja", "blister"):
+        unidad = "caja"
+
+    # Validar que el producto permita esa unidad (defaults abiertos para retrocompat).
+    if unidad == "blister" and not getattr(producto, "vende_blister", False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{producto.nombre} no está habilitado para vender por blíster",
+        )
+    if unidad == "caja" and getattr(producto, "vende_caja", True) is False:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{producto.nombre} no se vende por caja/expendedor; elegí otra unidad",
+        )
+
+    if unidad == "blister":
+        blisters = item_data.cantidad if item_data.cantidad is not None else item_data.cantidad_blisters
+        return 0, int(blisters or 0), "blister"
+
+    cajas = item_data.cantidad if item_data.cantidad is not None and item_data.cantidad_cajas == 0 else item_data.cantidad_cajas
+    return int(cajas or 0), int(item_data.cantidad_blisters or 0), "caja"
 
 
 def _build_item_response(item: PedidoItem) -> PedidoItemResponse:
@@ -114,12 +210,17 @@ def _build_item_response(item: PedidoItem) -> PedidoItemResponse:
         producto_id=item.producto_id,
         cantidad_cajas=item.cantidad_cajas,
         cantidad_blisters=item.cantidad_blisters,
-        cantidad=item.cantidad,
+        # `cantidad` = cantidad en la unidad de venta (blísters si se vendió por blíster),
+        # así el front y la UI muestran el número real y no 0.
+        cantidad=item.cantidad_venta,
+        unidad_venta=getattr(item, "unidad_venta", "caja"),
         precio_lista=float(item.precio_lista) if item.precio_lista is not None else None,
         descuento_porcentaje=float(item.descuento_porcentaje) if item.descuento_porcentaje is not None else None,
         precio_unitario=float(item.precio_unitario),
         precio_total=float(item.precio_total),
         producto_nombre=producto_nombre,
+        presentacion=item.producto.presentacion if item.producto else None,
+        blisters_por_caja=item.producto.blisters_por_caja if item.producto else None,
         margen=margen,
         producto_precios=producto_precios,
     )
@@ -162,6 +263,8 @@ def _build_pedido_response(pedido: Pedido) -> PedidoResponse:
         cliente_domicilio=pedido.cliente.domicilio if pedido.cliente else None,
         cliente_telefono=pedido.cliente.telefono or pedido.cliente.whatsapp if pedido.cliente else None,
         cliente_localidad=pedido.cliente.localidad_rel.nombre if pedido.cliente and pedido.cliente.localidad_rel else None,
+        cliente_codigo_postal=pedido.cliente.localidad_rel.codigo_postal if pedido.cliente and pedido.cliente.localidad_rel else None,
+        cliente_provincia=pedido.cliente.localidad_rel.provincia if pedido.cliente and pedido.cliente.localidad_rel else None,
         cliente_zona=pedido.cliente.zona_rel.nombre if pedido.cliente and pedido.cliente.zona_rel else None,
         repartidor_id=pedido.repartidor_id,
         repartidor_nombre=pedido.repartidor.nombre_completo if pedido.repartidor else None,
@@ -195,8 +298,10 @@ async def list_pedidos(
     tipo_documento: str | None = Query(None),
     fecha_desde: date | None = Query(None),
     fecha_hasta: date | None = Query(None),
+    fecha_entrega: date | None = Query(None, description="Filtrar por fecha de entrega exacta (logística)"),
     vendedor_id: int | None = Query(None),
     repartidor_id: int | None = Query(None),
+    sin_repartidor: bool = Query(False, description="Solo pedidos sin repartidor asignado"),
     column_filters: str | None = Query(None, alias="filters", description="JSON column filters"),
     sort_by: str | None = Query(None, description="Columna por la que ordenar"),
     sort_dir: str = Query("desc", description="Dirección de orden: asc o desc"),
@@ -233,6 +338,9 @@ async def list_pedidos(
     
     if repartidor_id is not None:
         filters.append(Pedido.repartidor_id == repartidor_id)
+
+    if sin_repartidor:
+        filters.append(Pedido.repartidor_id.is_(None))
 
     if search:
         like_pattern = f"%{search}%"
@@ -274,6 +382,8 @@ async def list_pedidos(
         filters.append(Pedido.fecha >= fecha_desde)
     if fecha_hasta:
         filters.append(Pedido.fecha <= fecha_hasta)
+    if fecha_entrega:
+        filters.append(Pedido.fecha_entrega == fecha_entrega)
 
     if filters:
         base_query = base_query.where(*filters)
@@ -394,10 +504,18 @@ async def get_pedido_calendario(
 @router.get("/rutas_entregas")
 async def get_rutas_entregas(
     fecha: date = Query(..., description="Fecha para trazar la ruta"),
+    estados: str = Query(
+        "listo_para_despacho,en_camino",
+        description="Estados de despacho a incluir (coma-separados). Permite planificar la ruta antes de despachar.",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Devuelve los pedidos en estado 'en_camino' para la fecha dada como lista plana."""
+    """Devuelve los pedidos de la fecha en los estados pedidos, como lista plana.
+
+    Por defecto incluye `listo_para_despacho` y `en_camino`, para poder PLANIFICAR
+    la ruta antes de despachar (antes solo se veían los `en_camino`).
+    """
 
     if current_user.rol.value not in (
         RolUsuario.ventas.value,
@@ -407,12 +525,27 @@ async def get_rutas_entregas(
     ):
         raise HTTPException(status_code=403, detail="No tienes permisos para ver rutas de entrega.")
 
+    # Parsear estados válidos del enum; descartar los desconocidos.
+    estados_enum = []
+    for e in (estados or "").split(","):
+        e = e.strip()
+        try:
+            estados_enum.append(EstadoDespacho(e))
+        except ValueError:
+            continue
+    if not estados_enum:
+        estados_enum = [EstadoDespacho.listo_para_despacho, EstadoDespacho.en_camino]
+
     query = (
         select(Pedido)
         .where(Pedido.fecha_entrega == fecha)
-        .where(Pedido.shipping_status == EstadoDespacho.en_camino)
+        .where(Pedido.shipping_status.in_(estados_enum))
         .options(*_load_options())
     )
+
+    # Un repartidor solo ve lo asignado a él.
+    if current_user.rol.value == RolUsuario.repartidor.value:
+        query = query.where(Pedido.repartidor_id == current_user.id)
 
     result = await db.execute(query)
     pedidos = result.scalars().all()
@@ -501,39 +634,49 @@ async def optimizar_ruta(
     # Ordenamos de menor a mayor según el waypoint_index
     coords_con_indice.sort(key=lambda x: x[1])
     
-    # Extraemos solo las tuplas (latitud, longitud) ya ordenadas para TomTom
-    coords_ordenadas_tomtom = [
+    # Extraemos solo las tuplas (latitud, longitud) ya ordenadas
+    coords_ordenadas = [
         (c.latitud, c.longitud) for c, idx in coords_con_indice
     ]
 
-    # 5. Llamar a TomTom para obtener la ruta enriquecida y con tráfico
-    try:
-        tomtom_data = await obtener_ruta_tomtom(coords_ordenadas_tomtom)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Error calculando ruta en TomTom: {str(e)}")
+    # 5. Trazar la ruta real. Por defecto OSRM (gratis, sin API key). Si hay
+    # TOMTOM_API_KEY configurada, se prefiere TomTom (agrega tráfico en tiempo real).
+    ruta_data = None
+    if settings.TOMTOM_API_KEY:
+        try:
+            ruta_data = await obtener_ruta_tomtom(coords_ordenadas)
+        except Exception as e:
+            print(f"TomTom falló, se usa OSRM: {e}")
+    if ruta_data is None:
+        try:
+            ruta_data = await obtener_ruta_osrm(coords_ordenadas)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Error calculando la ruta: {str(e)}")
 
     # 6. Guardar el Snapshot en la Base de Datos
     if not ruta:
         ruta = Ruta(hash_id=hash_id)
         db.add(ruta)
-    
-    ruta.ruta_geojson = json.dumps(tomtom_data["coords"])
-    ruta.distancia_km = tomtom_data["km"]
-    ruta.tiempo_minutos = tomtom_data["tiempo_minutos"]
-    ruta.tramos_json = json.dumps(tomtom_data["tramos"])
+
+    ruta.ruta_geojson = json.dumps(ruta_data["coords"])
+    ruta.distancia_km = ruta_data["km"]
+    ruta.tiempo_minutos = ruta_data["tiempo_minutos"]
+    ruta.tramos_json = json.dumps(ruta_data["tramos"])
     ruta.orden_waypoints = json.dumps(waypoints_indices)
-    ruta.fecha_entrega = date.today()
-    
+    # Fecha real de la ruta (no hoy hardcodeado), para que la invalidación de caché
+    # por fecha al editar una ubicación coincida.
+    ruta.fecha_entrega = request.fecha or date.today()
+
     await db.commit()
 
     # 7. Retornar al Frontend
     return OptimizarRutaResponse(
         hash_id=hash_id,
-        coords=tomtom_data["coords"],
-        km=tomtom_data["km"],
-        tiempo_minutos=tomtom_data["tiempo_minutos"],
+        coords=ruta_data["coords"],
+        km=ruta_data["km"],
+        tiempo_minutos=ruta_data["tiempo_minutos"],
         waypoints=waypoints_indices,
-        tramos=tomtom_data["tramos"]
+        tramos=ruta_data["tramos"]
     )
 
 @router.patch("/rutas/{hash_id}/iniciar")
@@ -654,7 +797,11 @@ async def actualizar_ubicacion(
         if pedido.cliente and pedido.cliente.localidad_rel
         else "Buenos Aires"
     )
-    lat, lon = await obtener_coordenadas_tomtom(body.direccion, ciudad)
+    # Geocoder unificado con el de alta/edición de cliente: OSM primero
+    # (mismo criterio que clientes.py), con TomTom como fallback.
+    lat, lon = await obtener_coordenadas_osm(body.direccion, ciudad)
+    if lat is None or lon is None:
+        lat, lon = await obtener_coordenadas_tomtom(body.direccion, ciudad)
     if lat is None or lon is None:
         raise HTTPException(status_code=422, detail="No se pudo geolocalizar la dirección ingresada")
 
@@ -797,7 +944,8 @@ async def create_pedido(
         despachado=body.despachado,
         sociedad=body.sociedad,
         observacion=body.observacion,
-        direccion_entrega=cliente.domicilio,
+        # Envío: usa la dirección editada; si no vino, el domicilio del cliente.
+        direccion_entrega=(body.direccion_entrega or "").strip() or cliente.domicilio,
         latitud=cliente.latitud,
         longitud=cliente.longitud,
         bultos=body.bultos,
@@ -846,9 +994,8 @@ async def create_pedido(
         # We assume if sociedad is None, it defaults to Farmacare or logic fallback
         es_sanalle = (body.sociedad and body.sociedad.lower() == "sanalle") or (tipo_doc == TipoDocumento.factura)
         
-        # Handle generic 'cantidad' if provided
-        cajas = item_data.cantidad if item_data.cantidad is not None and item_data.cantidad_cajas == 0 else item_data.cantidad_cajas
-        blisters = item_data.cantidad_blisters
+        # Resolver cantidades según el formato de venta de la línea (caja/blister)
+        cajas, blisters, unidad_venta = _resolver_cantidades(item_data, producto)
 
         if es_sanalle:
             producto.modify_stock_a(-cajas, -blisters)
@@ -864,6 +1011,7 @@ async def create_pedido(
             producto_id=item_data.producto_id,
             cantidad_cajas=cajas,
             cantidad_blisters=blisters,
+            unidad_venta=unidad_venta,
             precio_lista=Decimal(str(item_data.precio_lista)) if item_data.precio_lista is not None else None,
             descuento_porcentaje=Decimal(str(item_data.descuento_porcentaje)) if item_data.descuento_porcentaje is not None else None,
             precio_unitario=Decimal(str(item_data.precio_unitario)),
@@ -873,6 +1021,7 @@ async def create_pedido(
         db.add(pedido_item)
         importe_total += Decimal(str(item_data.precio_total))
 
+        _unidad_label = "blíster(s)" if unidad_venta == "blister" else "caja(s)"
         await registrar_evento(
             db,
             pedido=pedido,
@@ -880,7 +1029,7 @@ async def create_pedido(
             evento="creacion",
             accion="alta",
             entidad="item",
-            despues=f"{cajas} caja(s) @ ${Decimal(str(item_data.precio_unitario)):.2f}",
+            despues=f"{blisters if unidad_venta == 'blister' else cajas} {_unidad_label} @ ${Decimal(str(item_data.precio_unitario)):.2f}",
             producto_id=producto.id,
             producto_nombre=producto.nombre,
             grupo_id=grupo_id,
@@ -1000,10 +1149,9 @@ async def update_pedido(
                 )
             
             es_sanalle = (pedido.sociedad and pedido.sociedad.lower() == "sanalle") or (pedido.tipo_documento == TipoDocumento.factura)
-            
-            # Handle generic 'cantidad' if provided
-            cajas = item_data.cantidad if item_data.cantidad is not None and item_data.cantidad_cajas == 0 else item_data.cantidad_cajas
-            blisters = item_data.cantidad_blisters
+
+            # Resolver cantidades según el formato de venta de la línea (caja/blister)
+            cajas, blisters, unidad_venta = _resolver_cantidades(item_data, producto)
 
             if es_sanalle:
                 producto.modify_stock_a(-cajas, -blisters)
@@ -1019,6 +1167,7 @@ async def update_pedido(
                 producto_id=item_data.producto_id,
                 cantidad_cajas=cajas,
                 cantidad_blisters=blisters,
+                unidad_venta=unidad_venta,
                 precio_lista=Decimal(str(item_data.precio_lista)) if item_data.precio_lista is not None else None,
                 descuento_porcentaje=Decimal(str(item_data.descuento_porcentaje)) if item_data.descuento_porcentaje is not None else None,
                 precio_unitario=Decimal(str(item_data.precio_unitario)),
@@ -1103,6 +1252,14 @@ async def update_shipping_status(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Transición no permitida de '{pedido.shipping_status.value}' a '{nuevo_shipping.value}'. Válidos: {valid}",
+        )
+
+    # Gating por rol: operaciones y repartidor solo pueden hacer sus transiciones.
+    permitidas_rol = ROLE_SHIPPING_ALLOWED.get(current_user.rol.value)
+    if permitidas_rol is not None and (pedido.shipping_status.value, nuevo_shipping.value) not in permitidas_rol:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Tu rol no puede cambiar el estado de '{pedido.shipping_status.value}' a '{nuevo_shipping.value}'.",
         )
 
     # Stock adjustments on shipping change
@@ -1309,6 +1466,54 @@ async def asignar_repartidor(
     return {"message": f"{updated} pedidos actualizados", "updated": updated}
 
 
+@router.post("/despachar-ruta")
+async def despachar_ruta(
+    body: DespacharRutaRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "super_admin", "repartidor"])),
+):
+    """Despacha en masa: pasa varios pedidos de 'listo_para_despacho' a 'en_camino'.
+
+    Simétrico a rutas/{hash}/terminar (en_camino -> entregado). No mueve stock: el
+    stock se reservó al crear y se consume recién al entregar.
+    """
+    grupo_id = nuevo_grupo_id()
+    despachados = 0
+    saltados: list[str] = []
+    for pid in body.pedido_ids:
+        pedido = (await db.execute(select(Pedido).where(Pedido.id == pid))).scalar_one_or_none()
+        if not pedido:
+            continue
+        # Un repartidor solo despacha lo propio.
+        if current_user.rol.value == RolUsuario.repartidor.value and pedido.repartidor_id != current_user.id:
+            saltados.append(pedido.numero_pedido)
+            continue
+        estado_actual = pedido.shipping_status.value
+        if EstadoDespacho.en_camino.value not in SHIPPING_TRANSITIONS.get(estado_actual, []):
+            saltados.append(pedido.numero_pedido)
+            continue
+        anterior = pedido.shipping_status
+        pedido.shipping_status = EstadoDespacho.en_camino
+        pedido.despachado = True
+        await registrar_evento(
+            db,
+            pedido=pedido,
+            usuario=current_user,
+            evento="cambio_estado_despacho",
+            accion="modificacion",
+            entidad="pedido",
+            campo="shipping_status",
+            antes=anterior.value,
+            despues=EstadoDespacho.en_camino.value,
+            grupo_id=grupo_id,
+            observacion="Despacho de ruta en masa",
+        )
+        despachados += 1
+
+    await db.commit()
+    return {"despachados": despachados, "saltados": saltados}
+
+
 @router.get("/{id}/pdf")
 async def get_pedido_pdf(
     id: int,
@@ -1352,7 +1557,10 @@ async def get_pedido_pdf(
     items = [
         {
             "producto_nombre": item.producto.nombre if item.producto else f"Producto #{item.producto_id}",
-            "cantidad": item.cantidad,
+            # Cantidad en la unidad de venta real (blísters si corresponde) + la unidad.
+            "cantidad": item.cantidad_venta,
+            "unidad_venta": item.unidad_venta,
+            "unidad_label": item.unidad_label,
             "precio_unitario": 0.0 if sin_valores else float(item.precio_unitario),
             "precio_total": 0.0 if sin_valores else float(item.precio_total),
             "descuento_porcentaje": float(item.descuento_porcentaje) if item.descuento_porcentaje else None,
@@ -1368,6 +1576,54 @@ async def get_pedido_pdf(
         media_type="application/pdf",
         filename=filename,
     )
+
+
+@router.post("/hoja-ruta")
+async def get_hoja_ruta_pdf(
+    body: HojaRutaRequest,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """Hoja de ruta imprimible: las paradas en el ORDEN óptimo recibido del mapa."""
+    if not body.pedido_ids:
+        raise HTTPException(status_code=400, detail="No hay pedidos para la hoja de ruta")
+
+    result = await db.execute(
+        select(Pedido)
+        .where(Pedido.id.in_(body.pedido_ids))
+        .options(
+            selectinload(Pedido.cliente).selectinload(Cliente.localidad_rel),
+            selectinload(Pedido.cliente).selectinload(Cliente.zona_rel),
+            selectinload(Pedido.items).selectinload(PedidoItem.producto),
+        )
+    )
+    por_id = {p.id: p for p in result.scalars().all()}
+
+    paradas = []
+    # Respetar el orden recibido (ya optimizado en el frontend).
+    for orden, pid in enumerate(body.pedido_ids, start=1):
+        p = por_id.get(pid)
+        if not p:
+            continue
+        paradas.append({
+            "orden": orden,
+            "numero_pedido": p.numero_pedido,
+            "cliente": p.cliente.nombre if p.cliente else "Consumidor Final",
+            "direccion": p.direccion_entrega or (p.cliente.domicilio if p.cliente else ""),
+            "localidad": p.cliente.localidad_rel.nombre if p.cliente and p.cliente.localidad_rel else "",
+            "zona": p.cliente.zona_rel.nombre if p.cliente and p.cliente.zona_rel else None,
+            "telefono": (p.cliente.telefono or p.cliente.whatsapp or "") if p.cliente else "",
+            "bultos": p.bultos or 0,
+            "items": [
+                {"producto": (i.producto.nombre if i.producto else f"#{i.producto_id}"),
+                 "cantidad": i.cantidad_venta, "unidad": i.unidad_label}
+                for i in p.items
+            ],
+        })
+
+    filename = generate_hoja_ruta_pdf(str(body.fecha) if body.fecha else "", paradas)
+    full_path = os.path.join(settings.PDF_STORAGE_PATH, filename)
+    return FileResponse(path=full_path, media_type="application/pdf", filename=filename)
 
 
 @router.delete("/{id}")

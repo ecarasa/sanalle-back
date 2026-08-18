@@ -33,6 +33,7 @@ class ClienteBase(BaseModel):
     zona_id: Optional[int] = None
     condicion_pago: Optional[str] = None  # "contado" | "plazo"
     plazo_dias: Optional[int] = None
+    dias_entrega: Optional[int] = None
     vendedor_id: Optional[int] = None
     localidad_id: Optional[int] = None
     comentarios: Optional[str] = None
@@ -55,6 +56,7 @@ class ClienteUpdate(BaseModel):
     zona_id: Optional[int] = None
     condicion_pago: Optional[str] = None
     plazo_dias: Optional[int] = None
+    dias_entrega: Optional[int] = None
     vendedor_id: Optional[int] = None
     activo: Optional[bool] = None
     localidad_id: Optional[int] = None
@@ -70,6 +72,8 @@ class ClienteResponse(ClienteBase):
     created_at: datetime
     updated_at: datetime
     localidad_nombre: Optional[str] = None
+    localidad_provincia: Optional[str] = None
+    localidad_codigo_postal: Optional[str] = None
     zona_nombre: Optional[str] = None
 
     model_config = {"from_attributes": True}
@@ -82,3 +86,7 @@ class ClienteConDeuda(ClienteResponse):
     vendedor_nombre: Optional[str] = None
     semaforo: Optional[str] = None
     dias_mora: Optional[int] = None
+    # Semáforo de ACTIVIDAD (recencia de compra), distinto del semáforo de mora.
+    ultima_compra: Optional[str] = None       # fecha ISO de la última compra, o None
+    dias_ultima_compra: Optional[int] = None  # días desde la última compra
+    semaforo_actividad: Optional[str] = None  # "verde" | "amarillo" | "rojo"

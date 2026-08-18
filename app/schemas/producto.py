@@ -28,6 +28,10 @@ class ProductoBase(BaseModel):
     comprimidos_por_blister: Optional[int] = None
     blisters_por_caja: Optional[int] = None
     status: Optional[str] = None
+    # Formato de venta habilitado por producto
+    vende_caja: bool = True
+    vende_blister: bool = False
+    vende_comprimido: bool = False
     pvp: Optional[Decimal] = None
     fecha_act_pvp: Optional[datetime] = None
     margen_minorista: Optional[Decimal] = None
@@ -65,6 +69,9 @@ class ProductoUpdate(BaseModel):
     comprimidos_por_blister: Optional[int] = None
     blisters_por_caja: Optional[int] = None
     status: Optional[str] = None
+    vende_caja: Optional[bool] = None
+    vende_blister: Optional[bool] = None
+    vende_comprimido: Optional[bool] = None
     pvp: Optional[Decimal] = None
     fecha_act_pvp: Optional[datetime] = None
     margen_minorista: Optional[Decimal] = None
@@ -117,6 +124,9 @@ class ProductoPublicResponse(BaseModel):
     presentacion: Optional[str] = None
     comprimidos_por_blister: Optional[int] = None
     blisters_por_caja: Optional[int] = None
+    vende_caja: bool = True
+    vende_blister: bool = False
+    vende_comprimido: bool = False
     laboratorio_id: Optional[int] = None
     laboratorio_nombre: Optional[str] = None
     precios: dict[str, Optional[Decimal]] = {}

@@ -43,7 +43,9 @@ class ProveedorBase(BaseModel):
     contacto_telefono: Optional[str] = None
     contacto_email: Optional[str] = None
     descuento: Decimal = Decimal("0")
-    cashback: Decimal = Decimal("0")
+    cashback: Decimal = Decimal("0")  # deprecado
+    cashback_parcial: Decimal = Decimal("0")
+    cashback_total: Decimal = Decimal("0")
 
     @field_validator("nombre")
     @classmethod
@@ -72,6 +74,8 @@ class ProveedorUpdate(BaseModel):
     contacto_email: Optional[str] = None
     descuento: Optional[Decimal] = None
     cashback: Optional[Decimal] = None
+    cashback_parcial: Optional[Decimal] = None
+    cashback_total: Optional[Decimal] = None
     activo: Optional[bool] = None
 
 
@@ -86,6 +90,7 @@ class PagoDeudaProveedorRequest(BaseModel):
     aplicar_descuento: bool = False
     aplicar_cashback: bool = False
     pago_id: Optional[int] = None
+    cuenta_id: Optional[int] = None  # cuenta de la empresa desde donde sale la plata
     fecha: Optional[datetime] = None
 
 
@@ -102,5 +107,6 @@ class ProveedorResponse(ProveedorBase):
     pagos_pendientes: list[PagoPendienteInfo] = []
     notas: list[NotaProveedorInfo] = []
     total_notas_credito: Decimal = Decimal("0")
+    cashback_pendiente: Decimal = Decimal("0")
 
     model_config = {"from_attributes": True}

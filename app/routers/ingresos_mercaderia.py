@@ -4,7 +4,7 @@ from datetime import timedelta, datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -13,10 +13,11 @@ from app.core.database import get_db
 from app.models.user import User
 from app.models.producto import Producto
 from app.models.proveedor import Proveedor
-from app.models.ingreso_mercaderia import IngresoMercaderia, IngresoMercaderiaItem
+from app.models.ingreso_mercaderia import IngresoMercaderia, IngresoMercaderiaItem, IngresoImpuesto
 from app.models.pago_proveedor import PagoProveedorImputacion
 from app.schemas.ingreso_mercaderia import (
     IngresoImputacionResponse,
+    IngresoImpuestoResponse,
     IngresoMercaderiaCreate,
     IngresoMercaderiaResponse,
     IngresoMercaderiaItemResponse,
@@ -51,6 +52,17 @@ def _build_response(ingreso: IngresoMercaderia) -> IngresoMercaderiaResponse:
         )
         for imp in ingreso.imputaciones
     ]
+    impuestos = [
+        IngresoImpuestoResponse(
+            id=imp.id,
+            tipo_iva_id=imp.tipo_iva_id,
+            concepto=imp.concepto,
+            base=float(imp.base),
+            tasa=float(imp.tasa),
+            importe=float(imp.importe),
+        )
+        for imp in ingreso.impuestos
+    ]
     return IngresoMercaderiaResponse(
         id=ingreso.id,
         numero=ingreso.numero,
@@ -63,7 +75,9 @@ def _build_response(ingreso: IngresoMercaderia) -> IngresoMercaderiaResponse:
         creado_por_id=ingreso.creado_por_id,
         creado_por_nombre=ingreso.creado_por.nombre_completo if ingreso.creado_por else None,
         items=items,
+        impuestos=impuestos,
         imputaciones=imputaciones,
+        subtotal_neto=float(ingreso.subtotal_neto),
         importe_total=float(ingreso.importe_total),
         saldo_pendiente=float(ingreso.saldo_pendiente),
         fecha_vencimiento=ingreso.fecha_vencimiento,
@@ -82,6 +96,7 @@ async def _load_ingreso(id: int, db: AsyncSession) -> IngresoMercaderia:
             selectinload(IngresoMercaderia.proveedor),
             selectinload(IngresoMercaderia.creado_por),
             selectinload(IngresoMercaderia.items).selectinload(IngresoMercaderiaItem.producto),
+            selectinload(IngresoMercaderia.impuestos),
             selectinload(IngresoMercaderia.imputaciones).selectinload(PagoProveedorImputacion.pago_proveedor),
         )
     )
@@ -112,6 +127,7 @@ async def list_ingresos(
             selectinload(IngresoMercaderia.proveedor),
             selectinload(IngresoMercaderia.creado_por),
             selectinload(IngresoMercaderia.items).selectinload(IngresoMercaderiaItem.producto),
+            selectinload(IngresoMercaderia.impuestos),
             selectinload(IngresoMercaderia.imputaciones).selectinload(PagoProveedorImputacion.pago_proveedor),
         )
         .order_by(IngresoMercaderia.id.desc())
@@ -162,6 +178,7 @@ async def create_ingreso(
     db.add(ingreso)
     await db.flush()
 
+    subtotal_neto = Decimal("0")
     for item_data in body.items:
         # Validate and update stock/pricing
         prod_result = await db.execute(
@@ -177,8 +194,13 @@ async def create_ingreso(
         else:
             producto.modify_stock_a(item_data.cantidad_cajas, item_data.cantidad_blisters)
 
+        # Neto del renglón: costo por caja contemplando también los blisters (fracción de caja).
         costo_unit = Decimal(str(item_data.costo_unitario)) if item_data.costo_unitario else Decimal("0")
-        total_ingreso_item = costo_unit * item_data.cantidad_cajas
+        blisters_por_caja = Decimal(str(producto.get_blisters_por_caja() or 1))
+        cantidad_en_cajas = Decimal(item_data.cantidad_cajas) + (
+            Decimal(item_data.cantidad_blisters) / blisters_por_caja if blisters_por_caja else Decimal("0")
+        )
+        neto_item = (costo_unit * cantidad_en_cajas).quantize(Decimal("0.01"))
 
         item = IngresoMercaderiaItem(
             ingreso_id=ingreso.id,
@@ -188,21 +210,116 @@ async def create_ingreso(
             costo_unitario=costo_unit,
         )
         db.add(item)
-        ingreso.importe_total += total_ingreso_item
+        subtotal_neto += neto_item
 
-    # Actualizar saldo del proveedor
+    # Impuestos / percepciones de cabecera (IVA 21, 10.5, IIBB…): sobre el neto por defecto.
+    total_impuestos = Decimal("0")
+    for imp_data in body.impuestos:
+        base = Decimal(str(imp_data.base)) if imp_data.base is not None else subtotal_neto
+        tasa = Decimal(str(imp_data.tasa or 0))
+        if imp_data.importe is not None:
+            importe = Decimal(str(imp_data.importe))
+        else:
+            importe = (base * tasa / Decimal("100")).quantize(Decimal("0.01"))
+        db.add(IngresoImpuesto(
+            ingreso_id=ingreso.id,
+            tipo_iva_id=imp_data.tipo_iva_id,
+            concepto=imp_data.concepto,
+            base=base.quantize(Decimal("0.01")),
+            tasa=tasa,
+            importe=importe,
+        ))
+        total_impuestos += importe
+
+    ingreso.subtotal_neto = subtotal_neto.quantize(Decimal("0.01"))
+    ingreso.importe_total = (subtotal_neto + total_impuestos).quantize(Decimal("0.01"))
+
+    # Actualizar saldo del proveedor (deuda por el total con impuestos)
     if ingreso.proveedor_id:
         prov_result = await db.execute(select(Proveedor).where(Proveedor.id == ingreso.proveedor_id))
         proveedor = prov_result.scalar_one_or_none()
         if proveedor:
             proveedor.saldo_remito += ingreso.importe_total
-            ingreso.saldo_pendiente = ingreso.importe_total
+    ingreso.saldo_pendiente = ingreso.importe_total
 
     await db.commit()
 
     # Reload
     ingreso = await _load_ingreso(ingreso.id, db)
     return _build_response(ingreso)
+
+
+@router.delete("")
+async def eliminar_todos_ingresos(
+    confirmar: str = Query(..., description="Debe ser 'ELIMINAR' para confirmar el borrado total"),
+    revertir_stock: bool = Query(True, description="Descuenta del stock lo que estas compras habían ingresado"),
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    """Elimina TODOS los registros de compra (ingresos de mercadería) con sus items,
+    impuestos e imputaciones de pago.
+
+    Operación destructiva e irreversible. Deja el estado consistente:
+    - Si `revertir_stock` (por defecto), descuenta del stock las cantidades que cada
+      compra había ingresado (según su destino A/B).
+    - Resta del `saldo_remito` de cada proveedor el `importe_total` que la compra le había sumado.
+
+    Nota: no borra los pagos a proveedor (`pagos_proveedor`); solo desvincula sus
+    imputaciones contra estas compras. Si querés borrar también los pagos, usá el
+    botón de "Eliminar todas" en Transacciones.
+    """
+    if confirmar != "ELIMINAR":
+        raise HTTPException(status_code=400, detail="Confirmación inválida")
+
+    # Cargar todo con items + producto para poder revertir stock y saldo de proveedor.
+    result = await db.execute(
+        select(IngresoMercaderia).options(
+            selectinload(IngresoMercaderia.items).selectinload(IngresoMercaderiaItem.producto),
+        )
+    )
+    ingresos = result.scalars().unique().all()
+
+    if not ingresos:
+        return {"eliminados": 0, "detalle": {"ingresos": 0, "items": 0, "impuestos": 0, "imputaciones": 0}}
+
+    # Revertir stock (opcional) y acumular la deuda a restar por proveedor.
+    proveedor_deltas: dict[int, Decimal] = {}
+    for ing in ingresos:
+        if revertir_stock:
+            destino_b = (ing.destino or "A").upper() == "B"
+            for item in ing.items:
+                if not item.producto:
+                    continue
+                if destino_b:
+                    item.producto.modify_stock_b(-item.cantidad_cajas, -item.cantidad_blisters)
+                else:
+                    item.producto.modify_stock_a(-item.cantidad_cajas, -item.cantidad_blisters)
+        if ing.proveedor_id:
+            proveedor_deltas[ing.proveedor_id] = (
+                proveedor_deltas.get(ing.proveedor_id, Decimal("0")) + (ing.importe_total or Decimal("0"))
+            )
+
+    if proveedor_deltas:
+        provs = (
+            await db.execute(select(Proveedor).where(Proveedor.id.in_(proveedor_deltas.keys())))
+        ).scalars().all()
+        for p in provs:
+            p.saldo_remito = (p.saldo_remito or Decimal("0")) - proveedor_deltas.get(p.id, Decimal("0"))
+
+    await db.flush()
+
+    # Borrado en orden seguro respecto de las FKs.
+    # pago_proveedor_imputaciones.ingreso_mercaderia_id es ondelete=RESTRICT: borrarlas primero.
+    borrados: dict[str, int] = {}
+    borrados["imputaciones"] = (await db.execute(sa_delete(PagoProveedorImputacion))).rowcount
+    # items e impuestos tienen ondelete=CASCADE, pero los borramos explícito para reportar el conteo.
+    borrados["impuestos"] = (await db.execute(sa_delete(IngresoImpuesto))).rowcount
+    borrados["items"] = (await db.execute(sa_delete(IngresoMercaderiaItem))).rowcount
+    borrados["ingresos"] = (await db.execute(sa_delete(IngresoMercaderia))).rowcount
+
+    await db.commit()
+
+    return {"eliminados": borrados["ingresos"], "detalle": borrados}
 
 
 @router.get("/{id}/pdf")

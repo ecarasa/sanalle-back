@@ -22,12 +22,31 @@ class IngresoMercaderiaItemCreate(BaseModel):
     producto_id: int
     cantidad_cajas: int = 0
     cantidad_blisters: int = 0
-    costo_unitario: Optional[float] = None
+    costo_unitario: Optional[float] = None  # costo neto por caja
 
 
 class IngresoMercaderiaItemResponse(IngresoMercaderiaItemCreate):
     id: int
     producto_nombre: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class IngresoImpuestoCreate(BaseModel):
+    tipo_iva_id: Optional[int] = None
+    concepto: str
+    base: Optional[float] = None   # si no viene, se usa el subtotal neto
+    tasa: float = 0.0
+    importe: Optional[float] = None  # si no viene, se calcula base * tasa / 100
+
+
+class IngresoImpuestoResponse(BaseModel):
+    id: int
+    tipo_iva_id: Optional[int] = None
+    concepto: str
+    base: float
+    tasa: float
+    importe: float
 
     model_config = {"from_attributes": True}
 
@@ -44,6 +63,7 @@ class IngresoMercaderiaBase(BaseModel):
 class IngresoMercaderiaCreate(IngresoMercaderiaBase):
     destino: str = "A"  # "A" o "B" para Stock Blanco/Negro
     items: list[IngresoMercaderiaItemCreate]
+    impuestos: list[IngresoImpuestoCreate] = []
 
 
 class IngresoMercaderiaResponse(IngresoMercaderiaBase):
@@ -54,6 +74,8 @@ class IngresoMercaderiaResponse(IngresoMercaderiaBase):
     creado_por_nombre: Optional[str] = None
     proveedor_nombre: Optional[str] = None
     items: list[IngresoMercaderiaItemResponse] = []
+    impuestos: list[IngresoImpuestoResponse] = []
+    subtotal_neto: float = 0.0
     importe_total: float = 0.0
     saldo_pendiente: float = 0.0
     imputaciones: list[IngresoImputacionResponse] = []

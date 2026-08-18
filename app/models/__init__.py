@@ -18,6 +18,7 @@ from app.models.cuenta_sanalle import CuentaSanalle
 from app.models.pago_proveedor import PagoProveedor
 from app.models.movimiento_stock import MovimientoStock
 from app.models.notas_proveedor import NotaProveedor
+from app.models.cashback_proveedor import CashbackProveedor
 from app.models.laboratorios import Laboratorio
 from app.models.historial_pvp_producto import HistorialPvpProducto
 from app.models.bitacora_pedido import BitacoraPedido
@@ -26,6 +27,10 @@ from app.models.scraper_run import ScraperRun
 from app.models.scraper_run_item import ScraperRunItem
 from app.models.deposito import Deposito
 from app.models.stock_producto_deposito import StockProductoDeposito
+from app.models.chat import ChatConversacion, ChatParticipante, ChatMensaje
+from app.models.configuracion import Configuracion
+from app.models.cuenta import Cuenta
+from app.models.entidad import Entidad
 
 __all__ = [
     "User",
@@ -50,6 +55,7 @@ __all__ = [
     "PagoProveedor",
     "MovimientoStock",
     "NotaProveedor",
+    "CashbackProveedor",
     "Laboratorio",
     "HistorialPvpProducto",
     "BitacoraPedido",
@@ -58,4 +64,10 @@ __all__ = [
     "ScraperRunItem",
     "Deposito",
     "StockProductoDeposito",
+    "ChatConversacion",
+    "ChatParticipante",
+    "ChatMensaje",
+    "Configuracion",
+    "Cuenta",
+    "Entidad",
 ]

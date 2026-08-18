@@ -1,9 +1,10 @@
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -67,6 +68,7 @@ def _build_pago_response(
         transferencia_cuenta_origen=pago.transferencia_cuenta_origen,
         grupo_recibo_id=pago.grupo_recibo_id,
         tipo_cuenta=pago.tipo_cuenta.value,
+        es_puente=pago.es_puente,
         created_at=pago.created_at,
         updated_at=pago.updated_at,
         imputaciones=[
@@ -106,6 +108,8 @@ def _build_pago_response(
 async def list_pagos(
     cliente_id: int | None = Query(None),
     estado: str | None = Query(None),
+    fecha_desde: date | None = Query(None, description="Filtra por fecha_recepcion (desde, inclusive)"),
+    fecha_hasta: date | None = Query(None, description="Filtra por fecha_recepcion (hasta, inclusive)"),
     column_filters: str | None = Query(None, alias="filters", description="JSON column filters"),
     sort_by: str | None = Query(None, description="Columna por la que ordenar"),
     sort_dir: str = Query("desc", description="Dirección de orden: asc o desc"),
@@ -131,6 +135,11 @@ async def list_pagos(
             filters.append(Pago.estado == EstadoPago(estado))
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Estado inválido: {estado}")
+
+    if fecha_desde is not None:
+        filters.append(func.date(Pago.fecha_recepcion) >= fecha_desde)
+    if fecha_hasta is not None:
+        filters.append(func.date(Pago.fecha_recepcion) <= fecha_hasta)
 
     if filters:
         base_query = base_query.where(*filters)
@@ -296,6 +305,12 @@ async def create_pago(
 
     fecha_recepcion = body.fecha_recepcion if body.fecha_recepcion else datetime.now(timezone.utc)
 
+    # Cuenta: la elegida, o la cuenta por defecto de la empresa.
+    from app.routers.cuentas import asegurar_default
+    cuenta_id = body.cuenta_id
+    if not cuenta_id:
+        cuenta_id = (await asegurar_default(db)).id
+
     pago = Pago(
         cliente_id=body.cliente_id,
         receptor_id=current_user.id,
@@ -306,6 +321,7 @@ async def create_pago(
         observacion=body.observacion,
         numero_recibo=numero_recibo,
         banco_id=body.banco_id,
+        cuenta_id=cuenta_id,
         ch_numero=body.ch_numero,
         ch_banco=body.ch_banco,
         ch_fecha=body.ch_fecha,
@@ -319,19 +335,26 @@ async def create_pago(
         grupo_recibo_id=body.grupo_recibo_id,
         tipo_cuenta=tipo_cuenta_enum,
         saldo_restante=Decimal(str(body.importe)),
+        es_puente=body.es_puente,
     )
     db.add(pago)
     await db.flush()
 
-    # Register CuentaSanalle ingreso
+    # Register CuentaSanalle ingreso. Si es un cobro-pasamanos (cuenta puente), se
+    # registra como TRÁNSITO: la plata entra sólo para salir a un proveedor y no debe
+    # impactar la caja real ni inflar los ingresos.
     await registrar_movimiento(
         db=db,
         tipo=TipoMovimiento.ingreso,
-        categoria=CategoriaMovimiento.cobro_cliente,
+        categoria=CategoriaMovimiento.transito if pago.es_puente else CategoriaMovimiento.cobro_cliente,
         importe=pago.importe,
         metodo_pago=pago.tipo_pago,
         usuario_id=current_user.id,
-        descripcion=f"Cobro cliente: {cliente.nombre} (Recibo {pago.numero_recibo})",
+        descripcion=(
+            f"Tránsito (pasamanos) cliente: {cliente.nombre} (Recibo {pago.numero_recibo})"
+            if pago.es_puente
+            else f"Cobro cliente: {cliente.nombre} (Recibo {pago.numero_recibo})"
+        ),
         referencia_id=f"PAGO-{pago.id}",
         fecha=pago.fecha_recepcion
     )
@@ -395,6 +418,138 @@ async def create_pago(
     )
     result = await db.execute(reload_query)
     pago = result.scalar_one()
+
+    return _build_pago_response(pago, pago.imputaciones, pago.pagos_proveedor)
+
+
+class PagoDesdePedidoRequest(BaseModel):
+    """Registrar un pago rápido desde un pedido: crea el Pago e imputa a ese pedido."""
+    importe: float = Field(..., gt=0)
+    tipo_pago: str
+    fecha_recepcion: datetime | None = None
+    observacion: str | None = None
+    cuenta_id: int | None = None
+    banco_id: int | None = None
+    es_puente: bool = False  # cobro-pasamanos: la plata sale directo a un proveedor
+
+
+@router.post("/pedido/{pedido_id}", status_code=status.HTTP_201_CREATED)
+async def registrar_pago_pedido(
+    pedido_id: int,
+    body: PagoDesdePedidoRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crea un pago y lo imputa directamente a ESE pedido.
+
+    Endpoint fino que compone la lógica de create_pago + imputar_pago para el caso
+    "registrar pago desde el pedido". Habilitado para admin/super_admin o el vendedor
+    del pedido (evita relajar el imputar general, que es admin-only).
+    """
+    pedido = (await db.execute(select(Pedido).where(Pedido.id == pedido_id))).scalar_one_or_none()
+    if pedido is None:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+
+    if current_user.rol.value not in ("admin", "super_admin") and pedido.vendedor_id != current_user.id:
+        raise HTTPException(status_code=403, detail="No tiene permisos para registrar pagos de este pedido")
+
+    cliente = (
+        await db.execute(
+            select(Cliente).where(Cliente.id == pedido.cliente_id).options(selectinload(Cliente.localidad_rel))
+        )
+    ).scalar_one_or_none()
+    if cliente is None:
+        raise HTTPException(status_code=404, detail="Cliente del pedido no encontrado")
+
+    try:
+        tipo_pago_enum = TipoPago(body.tipo_pago)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tipo de pago inválido: {body.tipo_pago}. Valores válidos: {[t.value for t in TipoPago]}",
+        )
+
+    # El tipo de cuenta del pago sigue al tipo de documento del pedido (remito/factura).
+    tipo_cuenta_enum = TipoCuenta(pedido.tipo_documento.value) if pedido.tipo_documento else TipoCuenta.remito
+
+    # numero_recibo autogenerado (mismo patrón que create_pago).
+    max_numero = (
+        await db.execute(select(func.max(Pago.numero_recibo)).where(Pago.numero_recibo.like("REC-%")))
+    ).scalar_one()
+    next_num = int(max_numero.replace("REC-", "")) + 1 if max_numero else 1
+    numero_recibo = f"REC-{next_num:05d}"
+
+    fecha_recepcion = body.fecha_recepcion or datetime.now(timezone.utc)
+
+    from app.routers.cuentas import asegurar_default
+    cuenta_id = body.cuenta_id or (await asegurar_default(db)).id
+
+    importe_decimal = Decimal(str(body.importe))
+    pago = Pago(
+        cliente_id=cliente.id,
+        receptor_id=current_user.id,
+        tipo_pago=tipo_pago_enum,
+        importe=importe_decimal,
+        fecha_recepcion=fecha_recepcion,
+        estado=EstadoPago.recibido,
+        observacion=body.observacion,
+        numero_recibo=numero_recibo,
+        banco_id=body.banco_id,
+        cuenta_id=cuenta_id,
+        tipo_cuenta=tipo_cuenta_enum,
+        saldo_restante=importe_decimal,
+        es_puente=body.es_puente,
+    )
+    db.add(pago)
+    await db.flush()
+
+    # Si es pasamanos (cuenta puente) el ingreso va como TRÁNSITO: no impacta la caja real.
+    await registrar_movimiento(
+        db=db,
+        tipo=TipoMovimiento.ingreso,
+        categoria=CategoriaMovimiento.transito if pago.es_puente else CategoriaMovimiento.cobro_cliente,
+        importe=pago.importe,
+        metodo_pago=pago.tipo_pago,
+        usuario_id=current_user.id,
+        descripcion=(
+            f"Tránsito (pasamanos) cliente: {cliente.nombre} (Recibo {pago.numero_recibo}) - Pedido {pedido.numero_pedido}"
+            if pago.es_puente
+            else f"Cobro cliente: {cliente.nombre} (Recibo {pago.numero_recibo}) - Pedido {pedido.numero_pedido}"
+        ),
+        referencia_id=f"PAGO-{pago.id}",
+        fecha=pago.fecha_recepcion,
+    )
+
+    # Imputa a este pedido lo que se pueda (no más que su saldo pendiente).
+    # Un excedente queda como saldo a favor del cliente (saldo_restante del pago).
+    monto_imputar = min(importe_decimal, pedido.saldo_pendiente) if pedido.saldo_pendiente > 0 else Decimal("0")
+    if monto_imputar > 0:
+        db.add(PagoImputacion(pago_id=pago.id, pedido_id=pedido.id, monto=monto_imputar, observacion="Pago desde pedido"))
+        pedido.saldo_pendiente -= monto_imputar
+        pedido.payment_status = (
+            EstadoPagoPedido.pagado if pedido.saldo_pendiente <= 0 else EstadoPagoPedido.parcial
+        )
+        pago.saldo_restante -= monto_imputar
+
+    if pago.saldo_restante <= 0:
+        pago.estado = EstadoPago.imputado
+    elif pago.saldo_restante < importe_decimal:
+        pago.estado = EstadoPago.imputado_parcial
+
+    await db.commit()
+
+    pago = (
+        await db.execute(
+            select(Pago)
+            .where(Pago.id == pago.id)
+            .options(
+                selectinload(Pago.cliente),
+                selectinload(Pago.receptor),
+                selectinload(Pago.imputaciones).selectinload(PagoImputacion.pedido),
+                selectinload(Pago.pagos_proveedor).selectinload(PagoProveedor.proveedor),
+            )
+        )
+    ).scalar_one()
 
     return _build_pago_response(pago, pago.imputaciones, pago.pagos_proveedor)
 

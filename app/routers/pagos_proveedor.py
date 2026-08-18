@@ -10,7 +10,7 @@ from typing import List
 from app.core.database import get_db
 from app.models.pago_proveedor import PagoProveedor
 from app.models.proveedor import Proveedor
-from app.models.pago import TipoPago, TipoCuenta
+from app.models.pago import Pago, TipoPago, TipoCuenta
 from app.models.cuenta_sanalle import TipoMovimiento, CategoriaMovimiento
 from app.schemas.pago_proveedor import PagoProveedorCreate, PagoProveedorResponse
 from app.services.movimientos_service import registrar_movimiento
@@ -48,10 +48,26 @@ async def create_pago_proveedor(
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Tipo de cuenta inválido: {body.tipo_cuenta}")
 
+    # Si el pago está financiado por un cobro pasamanos (cuenta puente), es TRÁNSITO:
+    # no impacta la caja real y la salida no puede superar la entrada (el cobro).
+    pago_puente = None
+    if body.pago_id is not None:
+        pago_puente = (await db.execute(select(Pago).where(Pago.id == body.pago_id))).scalar_one_or_none()
+    es_transito = pago_puente is not None and pago_puente.es_puente
+    if es_transito and float(body.importe) > float(pago_puente.importe) + 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"El pago (${body.importe}) excede el cobro puente (${float(pago_puente.importe)}). "
+                "En una cuenta puente la salida no puede superar la entrada."
+            ),
+        )
+
     pago = PagoProveedor(
         proveedor_id=body.proveedor_id,
         usuario_id=current_user.id,
         pago_id=body.pago_id,
+        cuenta_id=body.cuenta_id,
         importe=body.importe,
         fecha_pago=body.fecha_pago,
         tipo_pago=tipo_pago_enum,
@@ -72,18 +88,40 @@ async def create_pago_proveedor(
     await registrar_movimiento(
         db=db,
         tipo=TipoMovimiento.egreso,
-        categoria=CategoriaMovimiento.pago_proveedor,
+        categoria=CategoriaMovimiento.transito if es_transito else CategoriaMovimiento.pago_proveedor,
         importe=pago.importe,
         metodo_pago=tipo_pago_enum,
         usuario_id=current_user.id,
-        descripcion=f"Pago a proveedor: {proveedor.nombre} - Ref: {pago.referencia_pago or 'S/N'}",
+        descripcion=(
+            f"Tránsito (pasamanos) → Pago a proveedor: {proveedor.nombre} - Ref: {pago.referencia_pago or 'S/N'}"
+            if es_transito
+            else f"Pago a proveedor: {proveedor.nombre} - Ref: {pago.referencia_pago or 'S/N'}"
+        ),
         referencia_id=f"PAGOPROV-{pago.id}",
         fecha=pago.fecha_pago
     )
 
     await db.commit()
     await db.refresh(pago)
-    return pago
+    # Construir la respuesta a mano (los enums son enum.Enum puros, no str: evitamos
+    # que la serialización por response_model falle).
+    return PagoProveedorResponse(
+        id=pago.id,
+        proveedor_id=pago.proveedor_id,
+        proveedor_nombre=proveedor.nombre,
+        usuario_id=pago.usuario_id,
+        pago_id=pago.pago_id,
+        cuenta_id=pago.cuenta_id,
+        importe=float(pago.importe),
+        fecha_pago=pago.fecha_pago,
+        tipo_pago=pago.tipo_pago.value,
+        tipo_cuenta=pago.tipo_cuenta.value,
+        referencia_pago=pago.referencia_pago,
+        observacion=pago.observacion,
+        imputaciones=[],
+        created_at=pago.created_at,
+        updated_at=pago.updated_at,
+    )
 
 
 @router.get("", response_model=List[PagoProveedorResponse])
@@ -93,12 +131,33 @@ async def list_pagos_proveedor(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Lista los pagos realizados a proveedores.
+    Lista los pagos realizados a proveedores (con el nombre del proveedor).
     """
-    query = select(PagoProveedor)
+    query = select(PagoProveedor, Proveedor.nombre).outerjoin(
+        Proveedor, PagoProveedor.proveedor_id == Proveedor.id
+    )
     if proveedor_id:
         query = query.where(PagoProveedor.proveedor_id == proveedor_id)
     query = query.order_by(PagoProveedor.fecha_pago.desc())
-    
-    res = await db.execute(query)
-    return res.scalars().all()
+
+    rows = (await db.execute(query)).all()
+    return [
+        PagoProveedorResponse(
+            id=pp.id,
+            proveedor_id=pp.proveedor_id,
+            proveedor_nombre=prov_nombre,
+            usuario_id=pp.usuario_id,
+            pago_id=pp.pago_id,
+            cuenta_id=pp.cuenta_id,
+            importe=float(pp.importe),
+            fecha_pago=pp.fecha_pago,
+            tipo_pago=pp.tipo_pago.value,
+            tipo_cuenta=pp.tipo_cuenta.value,
+            referencia_pago=pp.referencia_pago,
+            observacion=pp.observacion,
+            imputaciones=[],
+            created_at=pp.created_at,
+            updated_at=pp.updated_at,
+        )
+        for pp, prov_nombre in rows
+    ]

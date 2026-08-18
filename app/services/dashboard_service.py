@@ -6,8 +6,25 @@ from app.models.pago import Pago, EstadoPago
 from app.models.producto import Producto
 from app.models.cliente import Cliente
 from app.models.pedido_item import PedidoItem
+from app.models.ingreso_mercaderia import IngresoMercaderia
 from app.models.user import User
 from decimal import Decimal
+
+
+def _parse_range(desde: str | None, hasta: str | None) -> tuple[date | None, date | None]:
+    """Convierte 'YYYY-MM-DD' (o None) a (date|None, date|None), inclusive."""
+    d = date.fromisoformat(desde) if desde else None
+    h = date.fromisoformat(hasta) if hasta else None
+    return d, h
+
+
+def _rango_pedido_filters(desde: date | None, hasta: date | None) -> list:
+    filters = []
+    if desde is not None:
+        filters.append(Pedido.fecha >= desde)
+    if hasta is not None:
+        filters.append(Pedido.fecha <= hasta)
+    return filters
 
 
 def _six_months_range(ref: date | None = None):
@@ -71,10 +88,38 @@ async def _get_ventas_mensuales_grouped(db: AsyncSession, six_months_ago: date, 
     ]
 
 
-async def get_ventas_dashboard(db: AsyncSession, user_id: int) -> dict:
-    """Dashboard for ventas role - personal stats."""
+async def get_ventas_dashboard(db: AsyncSession, user_id: int, desde: str | None = None, hasta: str | None = None) -> dict:
+    """Dashboard for ventas role - personal stats.
+
+    Las tarjetas principales (pedidos, vendido, cobrado) se calculan sobre el
+    PERÍODO elegido [desde, hasta] (inclusive); si no se pasa, cae al mes actual.
+    Cobrado = importe_total − saldo_pendiente.
+    """
     now = datetime.now()
     month_start = date(now.year, now.month, 1)
+
+    # Rango efectivo del período (cae al mes actual si no viene nada).
+    rd, rh = _parse_range(desde, hasta)
+    if rd is None and rh is None:
+        rd = month_start
+    rango_filters = _rango_pedido_filters(rd, rh)
+
+    # Tarjetas principales del período: pedidos, importe vendido e importe cobrado.
+    result = await db.execute(
+        select(
+            func.coalesce(func.sum(Pedido.importe_total), 0),
+            func.coalesce(func.sum(Pedido.importe_total - Pedido.saldo_pendiente), 0),
+            func.count(Pedido.id),
+        ).where(and_(
+            Pedido.vendedor_id == user_id,
+            Pedido.shipping_status != EstadoDespacho.cancelado,
+            *rango_filters,
+        ))
+    )
+    row = result.one()
+    importe_vendido = float(row[0] or 0)
+    importe_cobrado = float(row[1] or 0)
+    total_pedidos = int(row[2] or 0)
 
     # Total vendido mes
     result = await db.execute(
@@ -165,6 +210,11 @@ async def get_ventas_dashboard(db: AsyncSession, user_id: int) -> dict:
     pedidos_cancelados = result.scalar() or 0
 
     return {
+        # Tarjetas del período elegido
+        "total_pedidos": total_pedidos,
+        "importe_vendido": importe_vendido,
+        "importe_cobrado": importe_cobrado,
+        # Métricas históricas / secundarias (no dependen del período)
         "total_vendido": total_vendido,
         "pedidos_mes": pedidos_mes,
         "pedidos_cancelados": pedidos_cancelados,
@@ -177,9 +227,57 @@ async def get_ventas_dashboard(db: AsyncSession, user_id: int) -> dict:
     }
 
 
-async def get_admin_dashboard(db: AsyncSession, mes: str | None = None) -> dict:
-    """Dashboard for admin role - global stats with new metrics, scoped to `mes` ('YYYY-MM')."""
+async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: str | None = None, hasta: str | None = None) -> dict:
+    """Dashboard for admin role - global stats.
+
+    Las tarjetas principales (ventas: vendido/cobrado/pedidos, y compras:
+    comprado/pagado) se calculan sobre el PERÍODO [desde, hasta] (inclusive).
+    El resto de gráficos/tablas históricos siguen apoyados en `mes`.
+    """
     month_start, next_month = _month_bounds(mes)
+
+    # Rango efectivo de las tarjetas de período (cae al mes si no viene desde/hasta).
+    rd, rh = _parse_range(desde, hasta)
+    if rd is None and rh is None:
+        rd = month_start
+        rh = next_month - timedelta(days=1)
+    rango_filters = _rango_pedido_filters(rd, rh)
+
+    # Ventas del período: importe vendido, importe cobrado, cantidad de pedidos.
+    result = await db.execute(
+        select(
+            func.coalesce(func.sum(Pedido.importe_total), 0),
+            func.coalesce(func.sum(Pedido.importe_total - Pedido.saldo_pendiente), 0),
+            func.count(Pedido.id),
+        ).where(and_(
+            Pedido.shipping_status != EstadoDespacho.cancelado,
+            *rango_filters,
+        ))
+    )
+    vrow = result.one()
+    periodo_importe_vendido = float(vrow[0] or 0)
+    periodo_importe_cobrado = float(vrow[1] or 0)
+    periodo_total_pedidos = int(vrow[2] or 0)
+
+    # Compras del período: importe comprado y pagado (pagado = total − saldo_pendiente).
+    compra_filters = []
+    if rd is not None:
+        compra_filters.append(IngresoMercaderia.fecha >= rd)
+    if rh is not None:
+        compra_filters.append(IngresoMercaderia.fecha <= rh)
+    result = await db.execute(
+        select(
+            func.coalesce(func.sum(IngresoMercaderia.importe_total), 0),
+            func.coalesce(func.sum(IngresoMercaderia.importe_total - IngresoMercaderia.saldo_pendiente), 0),
+        ).where(and_(*compra_filters)) if compra_filters else
+        select(
+            func.coalesce(func.sum(IngresoMercaderia.importe_total), 0),
+            func.coalesce(func.sum(IngresoMercaderia.importe_total - IngresoMercaderia.saldo_pendiente), 0),
+        )
+    )
+    crow = result.one()
+    periodo_importe_comprado = float(crow[0] or 0)
+    periodo_importe_pagado = float(crow[1] or 0)
 
     # Stock total
     result = await db.execute(select(func.coalesce(func.sum(Producto.stock_a_cajas), 0)).where(Producto.activo == True))
@@ -321,6 +419,13 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None) -> dict:
 
     return {
         "mes": month_start.strftime("%Y-%m"),
+        # Tarjetas del período elegido (ventas + compras)
+        "importe_vendido": periodo_importe_vendido,
+        "importe_cobrado": periodo_importe_cobrado,
+        "total_pedidos": periodo_total_pedidos,
+        "importe_comprado": periodo_importe_comprado,
+        "importe_pagado": periodo_importe_pagado,
+        # Métricas históricas / secundarias
         "stock_total": stock_total,
         "ventas_totales": ventas_totales,
         "pedidos_totales": pedidos_totales,

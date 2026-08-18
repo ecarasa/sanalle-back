@@ -34,7 +34,11 @@ class Proveedor(Base):
     plazo_pago: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
 
     descuento: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0, server_default="0", nullable=False)
+    # Deprecado: se mantiene por compatibilidad. La lógica usa cashback_parcial / cashback_total.
     cashback: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0, server_default="0", nullable=False)
+    # Cashback (%) según si el pago cancela el comprobante (total) o lo deja con saldo (parcial).
+    cashback_parcial: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0, server_default="0", nullable=False)
+    cashback_total: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0, server_default="0", nullable=False)
     contacto_nombre: Mapped[str | None] = mapped_column(String(100), nullable=True)
     contacto_telefono: Mapped[str | None] = mapped_column(String(50), nullable=True)
     contacto_email: Mapped[str | None] = mapped_column(String(255), nullable=True)

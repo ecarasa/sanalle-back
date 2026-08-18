@@ -3,7 +3,7 @@ import io
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, update as sa_update
+from sqlalchemy import select, func, and_, or_, update as sa_update
 from pydantic import BaseModel
 from app.core.database import get_db
 from app.core.security import get_password_hash
@@ -18,7 +18,12 @@ from app.models.zona import Zona
 from app.schemas.cliente import ClienteCreate, ClienteUpdate, ClienteResponse, ClienteConDeuda
 from app.utils.deps import get_current_user, require_role
 from app.utils.filters import apply_column_filters
-from app.services.semaforo_service import calcular_semaforo
+from app.services.semaforo_service import (
+    calcular_semaforo,
+    calcular_semaforo_actividad,
+    ACTIVIDAD_VERDE_DIAS,
+    ACTIVIDAD_AMARILLO_DIAS,
+)
 from app.services.geolocating import obtener_coordenadas_osm
 from decimal import Decimal
 
@@ -86,8 +91,10 @@ def _notas_subquery(cliente_id_col, tipo_cuenta=None, tipo_nota=None):
 async def list_clientes(
     search: str = Query("", description="Buscar por nombre, CUIT o razón social"),
     column_filters: str | None = Query(None, alias="filters", description="JSON column filters"),
+    actividad: str | None = Query(None, pattern="^(verde|amarillo|rojo)$", description="Filtrar por semáforo de actividad (recencia de compra)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=1000),
+    sin_paginar: bool = Query(False, alias="all", description="Devolver todos los clientes sin paginar (para filtrado en memoria en el front)"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -131,10 +138,16 @@ async def list_clientes(
     else:
         search_filter = base_filter
 
-    base_query = select(Cliente).where(search_filter)
-
-    from app.models.localidad import Localidad
-    from app.models.zona import Zona
+    # Los outer joins a Localidad/Zona son necesarios para que apply_column_filters
+    # pueda filtrar por localidad_nombre / zona_nombre (columnas de tablas unidas).
+    # Sin el join, SQLAlchemy hacía un cross join sin condición -> producto cartesiano
+    # y el filtro devolvía todos los clientes. Relaciones N->1: no duplican filas.
+    base_query = (
+        select(Cliente)
+        .outerjoin(Localidad, Cliente.localidad_id == Localidad.id)
+        .outerjoin(Zona, Cliente.zona_id == Zona.id)
+        .where(search_filter)
+    )
 
     base_query = apply_column_filters(
         base_query,
@@ -163,6 +176,44 @@ async def list_clientes(
         .scalar_subquery()
     )
 
+    # Última compra: fecha del pedido más reciente (no cancelado). Alimenta el
+    # semáforo de ACTIVIDAD (recencia), distinto del de mora.
+    ultima_compra_subquery = (
+        select(func.max(Pedido.fecha))
+        .where(
+            and_(
+                Pedido.cliente_id == Cliente.id,
+                Pedido.shipping_status != EstadoDespacho.cancelado,
+            )
+        )
+        .correlate(Cliente)
+        .scalar_subquery()
+    )
+
+    # Filtro por semáforo de actividad. Se aplica sobre base_query para que afecte
+    # también al conteo total. Umbrales alineados con calcular_semaforo_actividad.
+    if actividad:
+        from datetime import date, timedelta
+        hoy = date.today()
+        verde_desde = hoy - timedelta(days=ACTIVIDAD_VERDE_DIAS)
+        amarillo_desde = hoy - timedelta(days=ACTIVIDAD_AMARILLO_DIAS)
+        if actividad == "verde":
+            base_query = base_query.where(ultima_compra_subquery >= verde_desde)
+        elif actividad == "amarillo":
+            base_query = base_query.where(
+                and_(
+                    ultima_compra_subquery < verde_desde,
+                    ultima_compra_subquery >= amarillo_desde,
+                )
+            )
+        elif actividad == "rojo":
+            base_query = base_query.where(
+                or_(
+                    ultima_compra_subquery.is_(None),
+                    ultima_compra_subquery < amarillo_desde,
+                )
+            )
+
     count_query = select(func.count()).select_from(base_query.subquery())
     total_result = await db.execute(count_query)
     total = total_result.scalar_one()
@@ -174,7 +225,8 @@ async def list_clientes(
             deuda_remito_expr.label("deuda_remitos"),
             deuda_factura_expr.label("deuda_facturas"),
             oldest_pedido_fecha_subquery.label("oldest_pedido_fecha"),
-            User.nombre_completo.label("vendedor_nombre"), 
+            ultima_compra_subquery.label("ultima_compra_fecha"),
+            User.nombre_completo.label("vendedor_nombre"),
             Localidad.nombre.label("localidad_nombre"),
             Zona.nombre.label("zona_nombre")
         )
@@ -183,9 +235,11 @@ async def list_clientes(
         .outerjoin(Zona, Cliente.zona_id == Zona.id)
         .where(Cliente.id.in_(select(base_query.with_only_columns(Cliente.id).subquery().c.id)))
         .order_by(Cliente.nombre)
-        .offset((page - 1) * page_size)
-        .limit(page_size)
     )
+    # Cuando el front pide `all=true` traemos todo sin offset/limit para filtrar/ordenar
+    # en memoria. En ese modo la deuda se calcula para todos los clientes en una sola query.
+    if not sin_paginar:
+        deuda_query = deuda_query.offset((page - 1) * page_size).limit(page_size)
     result = await db.execute(deuda_query)
     rows = result.all()
 
@@ -193,7 +247,7 @@ async def list_clientes(
     from datetime import date
     today = date.today()
 
-    for cliente, deuda, deuda_remitos, deuda_facturas, oldest_fecha, vendedor_nombre, localidad_nombre, zona_nombre in rows:
+    for cliente, deuda, deuda_remitos, deuda_facturas, oldest_fecha, ultima_compra_fecha, vendedor_nombre, localidad_nombre, zona_nombre in rows:
         cliente_dict = ClienteResponse.model_validate(cliente).model_dump()
         deuda_float = float(deuda) if deuda else 0.0
         cliente_dict["deuda"] = deuda_float
@@ -202,7 +256,7 @@ async def list_clientes(
         cliente_dict["vendedor_nombre"] = vendedor_nombre
         cliente_dict["localidad_nombre"] = localidad_nombre
         cliente_dict["zona_nombre"] = zona_nombre
-        
+
         # Determine days overdue for semaphore
         days_overdue = None
         if oldest_fecha:
@@ -211,9 +265,16 @@ async def list_clientes(
             # If there is debt but no active pending order found, it must be from deuda_inicial
             # or legacy imputations. We treat it as old debt.
             days_overdue = None # calcular_semaforo handles None as "old debt" case
-            
+
         cliente_dict["semaforo"] = calcular_semaforo(deuda_float, days_overdue)
         cliente_dict["dias_mora"] = days_overdue
+
+        # Semáforo de ACTIVIDAD (recencia de compra)
+        dias_ultima = (today - ultima_compra_fecha).days if ultima_compra_fecha else None
+        cliente_dict["ultima_compra"] = ultima_compra_fecha.isoformat() if ultima_compra_fecha else None
+        cliente_dict["dias_ultima_compra"] = dias_ultima
+        cliente_dict["semaforo_actividad"] = calcular_semaforo_actividad(dias_ultima)
+
         items.append(ClienteConDeuda(**cliente_dict))
 
 
@@ -301,7 +362,15 @@ async def get_cliente(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Cliente no encontrado",
         )
-    return cliente
+    resp = ClienteResponse.model_validate(cliente)
+    # Enriquecer con los datos de la localidad (para la dirección de envío por defecto).
+    if cliente.localidad_id:
+        loc = (await db.execute(select(Localidad).where(Localidad.id == cliente.localidad_id))).scalar_one_or_none()
+        if loc:
+            resp.localidad_nombre = loc.nombre
+            resp.localidad_provincia = loc.provincia
+            resp.localidad_codigo_postal = loc.codigo_postal
+    return resp
 
 
 async def _update_cliente_coords(cliente: Cliente, db: AsyncSession):
@@ -406,6 +475,16 @@ _MERGE_MODELS = (
 class MergeClientesRequest(BaseModel):
     origen_id: int   # se absorbe y se elimina
     destino_id: int  # se conserva
+    # Valores finales elegidos campo por campo (independiente del orden de selección).
+    # Solo se aplican los campos de esta lista blanca al cliente destino.
+    campos_finales: dict[str, Any] | None = None
+
+
+_MERGE_CAMPOS_PERMITIDOS = {
+    "nombre", "razon_social", "cuit", "domicilio", "telefono", "whatsapp", "email",
+    "categoria", "tipo", "condicion_pago", "plazo_dias", "comentarios",
+    "localidad_id", "zona_id", "vendedor_id",
+}
 
 
 @router.get("/{id}/asociados")
@@ -453,6 +532,12 @@ async def merge_clientes(
     destino.deuda_inicial = (destino.deuda_inicial or Decimal(0)) + (origen.deuda_inicial or Decimal(0))
     destino.deuda_inicial_remito = (destino.deuda_inicial_remito or Decimal(0)) + (origen.deuda_inicial_remito or Decimal(0))
     destino.deuda_inicial_factura = (destino.deuda_inicial_factura or Decimal(0)) + (origen.deuda_inicial_factura or Decimal(0))
+
+    # Aplicar la elección de datos campo por campo al destino (whitelist).
+    if body.campos_finales:
+        for campo, valor in body.campos_finales.items():
+            if campo in _MERGE_CAMPOS_PERMITIDOS:
+                setattr(destino, campo, valor)
 
     origen_nombre = origen.nombre
     await db.delete(origen)

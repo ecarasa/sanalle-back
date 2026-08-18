@@ -16,6 +16,7 @@ class PagoBase(BaseModel):
     observacion: Optional[str] = None
     referencia: Optional[str] = None
     banco_id: Optional[int] = None
+    cuenta_id: Optional[int] = None  # cuenta de la empresa (si no se elige, va a la default)
     ch_numero: Optional[str] = None
     ch_banco: Optional[str] = None
     ch_fecha: Optional[date] = None
@@ -29,6 +30,7 @@ class PagoBase(BaseModel):
     grupo_recibo_id: Optional[str] = None
     tipo_cuenta: str = "remito"
     saldo_restante: float = 0.0
+    es_puente: bool = False  # cobro-pasamanos: la plata sale directo a un proveedor
 
 
 class PagoCreate(PagoBase):

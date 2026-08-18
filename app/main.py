@@ -12,6 +12,12 @@ from app.routers import (
     feature_flags,
 )
 from app.routers import scraper
+from app.routers import chat
+from app.routers import configuracion
+from app.routers import transacciones
+from app.routers import cuentas
+from app.routers import publico
+from app.routers import entidades
 from app.scheduler import scheduler, setup_scheduler
 from fastapi.openapi.utils import get_openapi
 
@@ -83,6 +89,12 @@ app.include_router(laboratorios.router, prefix="/api/v1/laboratorios", tags=["La
 app.include_router(depositos.router, prefix="/api/v1/depositos", tags=["Depositos"])
 app.include_router(scraper.router, prefix="/api/v1/scraper", tags=["Scraper"])
 app.include_router(feature_flags.router, prefix="/api/v1/feature-flags", tags=["FeatureFlags"])
+app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])
+app.include_router(configuracion.router, prefix="/api/v1/configuracion", tags=["Configuracion"])
+app.include_router(transacciones.router, prefix="/api/v1/transacciones", tags=["Transacciones"])
+app.include_router(cuentas.router, prefix="/api/v1/cuentas", tags=["Cuentas"])
+app.include_router(publico.router, prefix="/api/v1/publico", tags=["Publico"])
+app.include_router(entidades.router, prefix="/api/v1/entidades", tags=["Entidades"])
 
 
 @app.get("/")

@@ -184,6 +184,7 @@ async def create_nota(
             descripcion=item_data.descripcion,
             cantidad_cajas=item_data.cantidad_cajas,
             cantidad_blisters=item_data.cantidad_blisters,
+            unidad_venta=getattr(item_data, "unidad_venta", "caja") or "caja",
             precio_unitario=Decimal(str(item_data.precio_unitario)),
             precio_total=Decimal(str(item_data.precio_total)),
         )

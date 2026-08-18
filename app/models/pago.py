@@ -2,7 +2,7 @@ import enum
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -70,6 +70,11 @@ class Pago(Base):
         Integer, ForeignKey("bancos.id"), nullable=True, index=True
     )
 
+    # Cuenta de dinero de la empresa a la que ingresa este cobro.
+    cuenta_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("cuentas.id"), nullable=True, index=True
+    )
+
     # Cheque-specific fields
     ch_numero: Mapped[str | None] = mapped_column(String(50), nullable=True)
     ch_banco: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -88,6 +93,13 @@ class Pago(Base):
 
     # Group receipt
     grupo_recibo_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+
+    # Cuenta puente / pasamanos: el cobro no es plata propia, entra sólo para salir
+    # inmediatamente hacia un proveedor (linkeado por PagoProveedor.pago_id). El
+    # movimiento en el ledger se registra como tránsito y no impacta la caja real.
+    es_puente: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

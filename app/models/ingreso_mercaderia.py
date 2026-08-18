@@ -22,6 +22,10 @@ class IngresoMercaderia(Base):
     creado_por_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=False
     )
+    # Subtotal de los renglones (sin impuestos). importe_total = subtotal_neto + impuestos.
+    subtotal_neto: Mapped[Decimal] = mapped_column(
+        Numeric(14, 2), default=0, server_default="0", nullable=False
+    )
     importe_total: Mapped[Decimal] = mapped_column(
         Numeric(14, 2), default=0, server_default="0", nullable=False
     )
@@ -46,6 +50,9 @@ class IngresoMercaderia(Base):
     creado_por: Mapped["User"] = relationship("User", lazy="noload")  # noqa: F821
     items: Mapped[list["IngresoMercaderiaItem"]] = relationship(
         "IngresoMercaderiaItem", back_populates="ingreso", lazy="noload", cascade="all, delete-orphan"
+    )
+    impuestos: Mapped[list["IngresoImpuesto"]] = relationship(
+        "IngresoImpuesto", back_populates="ingreso", lazy="noload", cascade="all, delete-orphan"
     )
     imputaciones: Mapped[list["PagoProveedorImputacion"]] = relationship(  # noqa: F821
         "PagoProveedorImputacion", back_populates="ingreso", lazy="noload"
@@ -77,3 +84,27 @@ class IngresoMercaderiaItem(Base):
 
     def __repr__(self) -> str:
         return f"<IngresoMercaderiaItem(id={self.id}, ingreso_id={self.ingreso_id}, producto_id={self.producto_id})>"
+
+
+class IngresoImpuesto(Base):
+    """Línea de impuesto/percepción de cabecera de un ingreso (IVA 21, IVA 10.5, Perc. IIBB…)."""
+    __tablename__ = "ingreso_impuestos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ingreso_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("ingresos_mercaderia.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tipo_iva_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("tipo_iva.id"), nullable=True
+    )
+    concepto: Mapped[str] = mapped_column(String(100), nullable=False)
+    base: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0, server_default="0", nullable=False)
+    tasa: Mapped[Decimal] = mapped_column(Numeric(6, 2), default=0, server_default="0", nullable=False)
+    importe: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0, server_default="0", nullable=False)
+
+    ingreso: Mapped["IngresoMercaderia"] = relationship(
+        "IngresoMercaderia", back_populates="impuestos", lazy="noload"
+    )
+
+    def __repr__(self) -> str:
+        return f"<IngresoImpuesto(id={self.id}, concepto={self.concepto!r}, importe={self.importe})>"
