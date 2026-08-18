@@ -191,6 +191,25 @@ def _resolver_cantidades(item_data, producto: Producto) -> tuple[int, int, str]:
     return int(cajas or 0), int(item_data.cantidad_blisters or 0), "caja"
 
 
+def _validar_stock_disponible(producto: Producto, cajas: int, blisters: int, es_sanalle: bool) -> None:
+    """Bloquea la línea si pide más de lo que hay disponible en el depósito correspondiente.
+
+    Se llama justo antes de descontar stock (nunca después), así una línea sin stock
+    no llega a mutar nada y el pedido completo se rechaza con 400.
+    """
+    pedido_blisters = cajas * producto.get_blisters_por_caja + blisters
+    disponible_blisters = producto.total_blisters_a if es_sanalle else producto.total_blisters_b
+    if pedido_blisters > disponible_blisters:
+        disponible_cajas = disponible_blisters // producto.get_blisters_por_caja
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Stock insuficiente para {producto.nombre}: disponible {disponible_cajas} caja(s) "
+                f"({disponible_blisters} blísters), pedido supera lo disponible."
+            ),
+        )
+
+
 def _build_item_response(item: PedidoItem) -> PedidoItemResponse:
     producto_nombre = item.producto.nombre if item.producto else None
     margen = None
@@ -996,6 +1015,7 @@ async def create_pedido(
         
         # Resolver cantidades según el formato de venta de la línea (caja/blister)
         cajas, blisters, unidad_venta = _resolver_cantidades(item_data, producto)
+        _validar_stock_disponible(producto, cajas, blisters, es_sanalle)
 
         if es_sanalle:
             producto.modify_stock_a(-cajas, -blisters)
@@ -1152,6 +1172,7 @@ async def update_pedido(
 
             # Resolver cantidades según el formato de venta de la línea (caja/blister)
             cajas, blisters, unidad_venta = _resolver_cantidades(item_data, producto)
+            _validar_stock_disponible(producto, cajas, blisters, es_sanalle)
 
             if es_sanalle:
                 producto.modify_stock_a(-cajas, -blisters)
