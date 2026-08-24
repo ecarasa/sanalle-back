@@ -89,12 +89,24 @@ async def get_transiciones(
 # Transiciones de despacho permitidas por rol (además de SHIPPING_TRANSITIONS).
 # Los roles que NO figuran acá (admin, super_admin, ventas) no tienen restricción extra.
 ROLE_SHIPPING_ALLOWED: dict[str, set[tuple[str, str]]] = {
-    "operaciones": {("en_preparacion", "listo_para_despacho")},
+    "operaciones": {
+        ("en_preparacion", "listo_para_despacho"),
+        # Depósito es quien devuelve un pedido a `pendiente` para que se pueda
+        # corregir. Desde `listo_para_despacho` son dos pasos, porque no hay
+        # transición directa a pendiente.
+        ("en_preparacion", "pendiente"),
+        ("listo_para_despacho", "en_preparacion"),
+    },
     "repartidor": {
         ("listo_para_despacho", "en_camino"),
         ("en_camino", "entregado"),
     },
 }
+
+# Un pedido solo se puede editar en `pendiente`, así que devolverlo a ese estado
+# es lo que lo desbloquea: no lo hace cualquiera. Es tarea de depósito, y admin
+# queda de respaldo para que un pedido no se trabe si no hay nadie en depósito.
+ROLES_PUEDEN_REABRIR = ("operaciones", "admin", "super_admin")
 
 
 @router.get("/preparacion")
@@ -1118,9 +1130,19 @@ async def update_pedido(
     if body.vendedor_id is not None and not is_admin and body.vendedor_id != pedido.vendedor_id:
         raise HTTPException(status_code=403, detail="Solo admin puede cambiar el vendedor")
 
-    if body.items is not None and not is_admin:
-        if pedido.shipping_status not in (EstadoDespacho.pendiente, EstadoDespacho.en_preparacion):
-            raise HTTPException(status_code=403, detail="Solo admin puede editar items en este estado")
+    # Un pedido se edita solo mientras está en `pendiente`. Una vez que pasó a
+    # preparación, depósito ya está armando físicamente esa mercadería: si el
+    # pedido pudiera cambiar por debajo, lo que se arma y lo que se factura
+    # dejarían de coincidir. La regla no tiene excepción por rol a propósito;
+    # el camino para corregir es devolverlo a pendiente.
+    if pedido.shipping_status != EstadoDespacho.pendiente:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"El pedido está en '{pedido.shipping_status.value}' y no se puede editar. "
+                "Para modificarlo, depósito tiene que devolverlo a 'pendiente'."
+            ),
+        )
 
     # Bitácora: hay que fotografiar el estado ANTES de tocar nada. Los items se borran
     # y se recrean más abajo, así que después ya no habría con qué comparar.
@@ -1298,6 +1320,15 @@ async def update_shipping_status(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Tu rol no puede cambiar el estado de '{pedido.shipping_status.value}' a '{nuevo_shipping.value}'.",
+        )
+
+    # Devolver a `pendiente` es lo que habilita a editar el pedido, así que está
+    # restringido aunque la transición sea válida: ventas no puede reabrir sus
+    # propios pedidos una vez que depósito los tomó.
+    if nuevo_shipping == EstadoDespacho.pendiente and current_user.rol.value not in ROLES_PUEDEN_REABRIR:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo depósito puede devolver un pedido a 'pendiente' para que se pueda editar.",
         )
 
     # Stock adjustments on shipping change
