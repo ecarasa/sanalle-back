@@ -4,6 +4,8 @@ from datetime import datetime, date, timedelta
 from app.models.pedido import Pedido, EstadoDespacho
 from app.models.pago import Pago, EstadoPago
 from app.models.producto import Producto
+from app.models.deposito import Deposito
+from app.models.stock_producto_deposito import StockProductoDeposito
 from app.models.cliente import Cliente
 from app.models.pedido_item import PedidoItem
 from app.models.ingreso_mercaderia import IngresoMercaderia
@@ -279,8 +281,14 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
     periodo_importe_comprado = float(crow[0] or 0)
     periodo_importe_pagado = float(crow[1] or 0)
 
-    # Stock total
-    result = await db.execute(select(func.coalesce(func.sum(Producto.stock_a_cajas), 0)).where(Producto.activo == True))
+    # Stock total: suma de todos los depósitos activos, no solo el viejo stock A.
+    result = await db.execute(
+        select(func.coalesce(func.sum(StockProductoDeposito.cajas), 0))
+        .select_from(StockProductoDeposito)
+        .join(Producto, Producto.id == StockProductoDeposito.producto_id)
+        .join(Deposito, Deposito.id == StockProductoDeposito.deposito_id)
+        .where(and_(Producto.activo == True, Deposito.activo == True))
+    )
     stock_total = result.scalar() or 0
 
     # Ventas totales mes
@@ -331,14 +339,18 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
     )
     ventas_vendedor = [{"vendedor": r[0], "total": float(r[1])} for r in result.all()]
 
-    # Top productos por stock
+    # Top productos por stock (sumando depósitos activos)
     result = await db.execute(
-        select(Producto.nombre, Producto.stock_a_cajas)
-        .where(Producto.activo == True)
-        .order_by(Producto.stock_a_cajas.desc())
+        select(Producto.nombre, func.sum(StockProductoDeposito.cajas).label("cajas"))
+        .select_from(Producto)
+        .join(StockProductoDeposito, StockProductoDeposito.producto_id == Producto.id)
+        .join(Deposito, Deposito.id == StockProductoDeposito.deposito_id)
+        .where(and_(Producto.activo == True, Deposito.activo == True))
+        .group_by(Producto.id, Producto.nombre)
+        .order_by(func.sum(StockProductoDeposito.cajas).desc())
         .limit(10)
     )
-    top_stock = [{"nombre": r[0], "stock": r[1]} for r in result.all()]
+    top_stock = [{"nombre": r[0], "stock": int(r[1] or 0)} for r in result.all()]
 
     # Distribucion tipos de pago
     result = await db.execute(
@@ -369,13 +381,27 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
     )
     top_vendedores = [{"vendedor": r[0], "total": float(r[1]), "pedidos": r[2]} for r in result.all()]
 
-    # Productos con stock bajo (stock_a_cajas <= stock_minimo_cajas)
+    # Productos con stock bajo: el total de todos los depósitos contra el mínimo.
+    # Un producto sin ninguna fila de stock cuenta como 0 (de ahí el LEFT JOIN).
+    cajas_totales = func.coalesce(func.sum(StockProductoDeposito.cajas), 0)
     result = await db.execute(
-        select(Producto).where(
-            and_(Producto.activo == True, Producto.stock_a_cajas <= Producto.stock_minimo_cajas, Producto.stock_minimo_cajas > 0)
-        ).order_by(Producto.stock_a_cajas).limit(20)
+        select(Producto.id, Producto.nombre, Producto.codigo, Producto.stock_minimo_cajas, cajas_totales)
+        .select_from(Producto)
+        .outerjoin(StockProductoDeposito, StockProductoDeposito.producto_id == Producto.id)
+        .outerjoin(
+            Deposito,
+            and_(Deposito.id == StockProductoDeposito.deposito_id, Deposito.activo == True),
+        )
+        .where(and_(Producto.activo == True, Producto.stock_minimo_cajas > 0))
+        .group_by(Producto.id, Producto.nombre, Producto.codigo, Producto.stock_minimo_cajas)
+        .having(cajas_totales <= Producto.stock_minimo_cajas)
+        .order_by(cajas_totales)
+        .limit(20)
     )
-    stock_bajo = [{"id": p.id, "nombre": p.nombre, "codigo": p.codigo, "stock": p.stock_a_cajas, "stock_minimo": p.stock_minimo_cajas} for p in result.scalars().all()]
+    stock_bajo = [
+        {"id": r[0], "nombre": r[1], "codigo": r[2], "stock": int(r[4] or 0), "stock_minimo": r[3]}
+        for r in result.all()
+    ]
 
     # REP-02: Pagos pendientes de imputacion (recibido state)
     result = await db.execute(

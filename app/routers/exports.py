@@ -10,6 +10,8 @@ from app.core.database import get_db
 from app.models.user import User
 from app.models.cliente import Cliente
 from app.models.producto import Producto
+from app.models.deposito import Deposito
+from app.models.stock_producto_deposito import StockProductoDeposito
 from app.models.pedido import Pedido
 from app.models.pago import Pago
 from app.services.pricing_service import LISTAS
@@ -281,9 +283,28 @@ async def export_productos(
     result = await db.execute(query)
     productos = result.scalars().unique().all()
 
+    # Una columna de stock por depósito activo, en el orden del maestro.
+    depositos = (
+        await db.execute(
+            select(Deposito).where(Deposito.activo == True).order_by(Deposito.orden, Deposito.id)
+        )
+    ).scalars().all()
+    stock_por_producto = {
+        (pid, dep_id): cajas
+        for pid, dep_id, cajas in (
+            await db.execute(
+                select(
+                    StockProductoDeposito.producto_id,
+                    StockProductoDeposito.deposito_id,
+                    StockProductoDeposito.cajas,
+                )
+            )
+        ).all()
+    }
+
     columns = [
         "ID", "Código", "Nombre", "Laboratorio", "Categoría", "Presentación",
-        "Stock A", "Stock B", "PVP",
+        *(f"Stock {d.nombre}" for d in depositos), "PVP",
         *(lista.label for lista in LISTAS),
     ]
     rows = [
@@ -294,8 +315,7 @@ async def export_productos(
             p.laboratorio.nombre if p.laboratorio else "",
             p.categoria_producto or "",
             p.presentacion or "",
-            p.stock_a_cajas,
-            p.stock_b_cajas,
+            *(stock_por_producto.get((p.id, d.id), 0) for d in depositos),
             float(p.pvp) if p.pvp else "",
             *(
                 float(getattr(p, lista.precio_field))

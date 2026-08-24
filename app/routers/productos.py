@@ -13,6 +13,9 @@ from app.models.proveedor import Proveedor
 from app.models.laboratorios import Laboratorio
 from app.models.user import User
 from app.models.movimiento_stock import MovimientoStock
+from app.models.deposito import Deposito
+from app.models.stock_producto_deposito import StockProductoDeposito
+from app.services import stock_service
 from app.schemas.producto import (
     ProductoCreate, ProductoUpdate, ProductoResponse, ProductoPublicResponse,
     PreciosBulkUpdate, PreciosPorcentajeUpdate
@@ -35,8 +38,13 @@ from app.utils.filters import apply_column_filters
 
 
 def _stocks_por_deposito(p: Producto) -> list[dict]:
-    """Stock del producto por depósito (ordenado), desde la tabla nueva."""
-    stocks = getattr(p, "stocks_deposito", None) or []
+    """Stock del producto por depósito, ordenado como el maestro de depósitos.
+
+    `total_blisters` es lo vendible expresado en la unidad chica: es contra eso
+    que el formulario de venta decide si alcanza, sin tener que rehacer la cuenta
+    de cajas × blisters_por_caja en el front.
+    """
+    por_caja = p.get_blisters_por_caja
     rows = [
         {
             "deposito_id": s.deposito_id,
@@ -45,11 +53,25 @@ def _stocks_por_deposito(p: Producto) -> list[dict]:
             "activo": s.deposito.activo if s.deposito else True,
             "cajas": s.cajas,
             "blisters": s.blisters,
+            "reservado_cajas": s.reservado_cajas,
+            "reservado_blisters": s.reservado_blisters,
+            "total_blisters": s.total_blisters(por_caja),
+            "reservado_total_blisters": s.total_reservado_blisters(por_caja),
         }
-        for s in stocks
+        for s in (getattr(p, "stocks_deposito", None) or [])
     ]
     rows.sort(key=lambda r: (r["orden"], r["deposito_id"]))
     return rows
+
+
+# Total de cajas del producto sumando todos los depósitos. Se usa para ordenar y
+# filtrar la grilla, donde interesa "cuánto hay" y no en qué góndola está.
+_STOCK_TOTAL_CAJAS = (
+    select(func.coalesce(func.sum(StockProductoDeposito.cajas), 0))
+    .where(StockProductoDeposito.producto_id == Producto.id)
+    .correlate(Producto)
+    .scalar_subquery()
+)
 
 
 def _producto_to_response(p: Producto) -> dict:
@@ -120,13 +142,16 @@ async def list_productos(
         Producto,
         column_filters,
         allowed_columns={
-            "codigo", "nombre", "stock_a_cajas", "stock_b_cajas", "stock_minimo_cajas", "status",
+            "codigo", "nombre", "stock_total_cajas", "stock_minimo_cajas", "status",
             "categoria_producto", "presentacion", "pvp", "costo_mas_iibb",
             "laboratorio_nombre",
             *PRECIO_FIELDS,
             *MARGEN_FIELDS,
         },
-        extra_mappings={"laboratorio_nombre": Laboratorio.nombre},
+        extra_mappings={
+            "laboratorio_nombre": Laboratorio.nombre,
+            "stock_total_cajas": _STOCK_TOTAL_CAJAS,
+        },
     )
 
     count_query = select(func.count()).select_from(base_query.subquery())
@@ -144,8 +169,7 @@ async def list_productos(
         "presentacion": Producto.presentacion,
         "categoria_producto": Producto.categoria_producto,
         "status": Producto.status,
-        "stock_a_cajas": Producto.stock_a_cajas,
-        "stock_b_cajas": Producto.stock_b_cajas,
+        "stock_total_cajas": _STOCK_TOTAL_CAJAS,
     }
     sort_col = _SORT_COLUMNS.get(sort_by, Producto.nombre)
     order_expr = sort_col.desc() if sort_dir == "desc" else sort_col.asc()
@@ -230,6 +254,10 @@ async def build_public_catalogo(
     def _to_item(p: Producto) -> dict:
         d = ProductoPublicResponse.model_validate(p).model_dump()
         d["laboratorio_nombre"] = p.laboratorio.nombre if p.laboratorio else None
+        # En el catálogo solo importa si hay o no: se suman los depósitos activos.
+        d["stock_total_cajas"] = sum(
+            st.cajas for st in (p.stocks_deposito or []) if not st.deposito or st.deposito.activo
+        )
         d["precios"] = precios_de(p, lista)
         return d
 
@@ -706,93 +734,55 @@ async def operacion_stock(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(select(Producto).where(Producto.id == id))
+    """Ajuste manual o transferencia de stock entre depósitos.
+
+    Ya no existe FRACTION: el stock se guarda en blísters y se re-normaliza a
+    cajas + sueltos en cada movimiento, así que romper una caja no es una
+    operación, pasa solo cuando una venta lo necesita.
+    """
+    result = await db.execute(select(Producto).where(Producto.id == id).with_for_update())
     producto = result.scalar_one_or_none()
     if not producto:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
 
-    # Actualizar stock del producto
-    if req.tipo_operacion == 'TRANSFER':
-        if req.origen == 'STOCK_A':
-            producto.stock_a_cajas -= req.cantidad_cajas
-            producto.stock_a_blisters -= req.cantidad_blisters
-            producto.stock_b_cajas += req.cantidad_cajas
-            producto.stock_b_blisters += req.cantidad_blisters
-        else:
-            producto.stock_b_cajas -= req.cantidad_cajas
-            producto.stock_b_blisters -= req.cantidad_blisters
-            producto.stock_a_cajas += req.cantidad_cajas
-            producto.stock_a_blisters += req.cantidad_blisters
-    elif req.tipo_operacion == 'FRACTION':
-        per_caja = producto.blisters_por_caja or 0
-        if per_caja <= 0:
-            raise HTTPException(status_code=400, detail="Producto no tiene configurado blisters por caja")
-        
-        if req.origen == 'STOCK_A':
-            producto.stock_a_cajas -= 1
-            producto.stock_a_blisters += per_caja
-        else:
-            producto.stock_b_cajas -= 1
-            producto.stock_b_blisters += per_caja
-    elif req.tipo_operacion in ['ADJUST', 'MANUAL']:
-        if req.deposito_id is not None:
-            # Ajuste por depósito (soporta depósitos nuevos, no solo A/B)
-            from app.models.deposito import Deposito
-            from app.models.stock_producto_deposito import StockProductoDeposito
-            dep = (await db.execute(select(Deposito).where(Deposito.id == req.deposito_id))).scalar_one_or_none()
-            if dep is None:
-                raise HTTPException(status_code=404, detail="Depósito no encontrado")
-            if dep.stock_legacy == 'a':
-                producto.stock_a_cajas += req.cantidad_cajas
-                producto.stock_a_blisters += req.cantidad_blisters
-            elif dep.stock_legacy == 'b':
-                producto.stock_b_cajas += req.cantidad_cajas
-                producto.stock_b_blisters += req.cantidad_blisters
-            else:
-                # Depósito nuevo: escribe directo en la tabla por depósito
-                row = (await db.execute(
-                    select(StockProductoDeposito).where(
-                        StockProductoDeposito.producto_id == producto.id,
-                        StockProductoDeposito.deposito_id == dep.id,
-                    )
-                )).scalar_one_or_none()
-                if row is None:
-                    row = StockProductoDeposito(producto_id=producto.id, deposito_id=dep.id, cajas=0, blisters=0)
-                    db.add(row)
-                row.cajas += req.cantidad_cajas
-                row.blisters += req.cantidad_blisters
-                if row.cajas < 0 or row.blisters < 0:
-                    raise HTTPException(status_code=400, detail="La operación resultaría en stock negativo")
-        elif req.origen == 'STOCK_A':
-            producto.stock_a_cajas += req.cantidad_cajas
-            producto.stock_a_blisters += req.cantidad_blisters
-        else:
-            producto.stock_b_cajas += req.cantidad_cajas
-            producto.stock_b_blisters += req.cantidad_blisters
+    tipo = (req.tipo_operacion or "").upper()
+    if tipo == "MANUAL":  # nombre viejo del ajuste manual
+        tipo = "ADJUST"
+
+    if tipo == "ADJUST":
+        dep = await stock_service.validar_deposito(db, req.deposito_id)
+        await stock_service.ajustar(db, producto, dep.id, req.cantidad_cajas, req.cantidad_blisters)
+        # Un ajuste positivo entra al depósito; uno negativo sale de él.
+        entra = (req.cantidad_cajas + req.cantidad_blisters) >= 0
+        origen_id, destino_id = (None, dep.id) if entra else (dep.id, None)
+    elif tipo == "TRANSFER":
+        origen = await stock_service.validar_deposito(db, req.deposito_id)
+        destino = await stock_service.validar_deposito(db, req.deposito_destino_id)
+        await stock_service.transferir(
+            db, producto, origen.id, destino.id, req.cantidad_cajas, req.cantidad_blisters
+        )
+        origen_id, destino_id = origen.id, destino.id
     else:
-        raise HTTPException(status_code=400, detail=f"Tipo de operación '{req.tipo_operacion}' no reconocida")
+        raise HTTPException(
+            status_code=400, detail=f"Tipo de operación '{req.tipo_operacion}' no reconocida"
+        )
 
-    # Validar que no quede stock negativo
-    if (producto.stock_a_cajas < 0 or producto.stock_a_blisters < 0 or 
-        producto.stock_b_cajas < 0 or producto.stock_b_blisters < 0):
-        raise HTTPException(status_code=400, detail="La operación resultaría en stock negativo")
-
-    # Registrar el movimiento
-    movimiento = MovimientoStock(
-        producto_id=producto.id,
-        usuario_id=current_user.id,
-        tipo_operacion=req.tipo_operacion,
-        origen=req.origen,
-        destino=req.destino,
-        cantidad_cajas=req.cantidad_cajas if req.tipo_operacion != 'FRACTION' else 1,
-        cantidad_blisters=req.cantidad_blisters if req.tipo_operacion != 'FRACTION' else (producto.blisters_por_caja or 0),
-        observacion=req.observacion
+    db.add(
+        MovimientoStock(
+            producto_id=producto.id,
+            usuario_id=current_user.id,
+            tipo_operacion=tipo,
+            deposito_origen_id=origen_id,
+            deposito_destino_id=destino_id,
+            cantidad_cajas=req.cantidad_cajas,
+            cantidad_blisters=req.cantidad_blisters,
+            observacion=req.observacion,
+        )
     )
-    
-    db.add(movimiento)
+
     await db.commit()
     await db.refresh(producto)
-    
+
     return _producto_to_response(producto)
 
 
@@ -817,15 +807,17 @@ async def delete_producto(
 
 
 def _map_producto_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Mapea una fila del importador JSON a campos del maestro de productos.
+
+    El stock quedó fuera a propósito: vive por depósito y entra por ingreso de
+    mercadería o ajuste manual, que dejan movimiento y responsable. Una
+    importación de maestro no debería poder pisar existencias en silencio.
+    """
     if "p_codigo" in row:
-        codigo = (row.get("p_codigo") or "").strip()
-        nombre = (row.get("p_nombre") or "").strip()
-        stock_str = row.get("p_stockactual", "0")
         pvp_str = row.get("p_precioventa", "0")
         return {
-            "codigo": codigo,
-            "nombre": nombre,
-            "stock_a_cajas": int(stock_str) if stock_str else 0,
+            "codigo": (row.get("p_codigo") or "").strip(),
+            "nombre": (row.get("p_nombre") or "").strip(),
             "pvp": float(pvp_str) if pvp_str else None,
             "foto_url": (row.get("p_foto") or "").strip() or None,
         }
@@ -833,7 +825,6 @@ def _map_producto_row(row: dict[str, Any]) -> dict[str, Any] | None:
         return {
             "codigo": (row.get("codigo") or "").strip(),
             "nombre": (row.get("nombre") or "").strip(),
-            "stock_a_cajas": int(row.get("stock_a_cajas", row.get("stock_a_cajas", 0))),
             "pvp": row.get("pvp") or row.get("precio_venta"),
             "foto_url": row.get("foto_url"),
         }
@@ -922,14 +913,22 @@ async def import_productos_excel(
 
     OPTIONAL = {
         "pvp": "pvp",
-        "stock a cajas": "stock_a_cajas",
-        "stock a blisters": "stock_a_blisters",
-        "stock b cajas": "stock_b_cajas",
-        "stock b blisters": "stock_b_blisters",
         "margen minorista %": "margen_minorista",
         "margen mayorista %": "margen_mayorista",
         "margen comercio %": "margen_comercio",
     }
+
+    # Columnas de stock: una por depósito existente, resueltas por nombre.
+    # Así crear un depósito nuevo habilita su columna sin tocar código.
+    # Ej. "Stock Sanalle cajas" / "Stock Sanalle blisters".
+    depositos_all = (
+        await db.execute(select(Deposito).order_by(Deposito.orden, Deposito.id))
+    ).scalars().all()
+    STOCK_COLS: dict[str, tuple[int, str]] = {}
+    for dep in depositos_all:
+        base = dep.nombre.strip().lower()
+        STOCK_COLS[f"stock {base} cajas"] = (dep.id, "cajas")
+        STOCK_COLS[f"stock {base} blisters"] = (dep.id, "blisters")
 
     def _cell(row_vals: tuple, header: str):
         idx = col.get(header)
@@ -995,12 +994,20 @@ async def import_productos_excel(
             val = _cell(row, header)
             if val is not None:
                 try:
-                    if field in ("stock_a_cajas", "stock_a_blisters", "stock_b_cajas", "stock_b_blisters"):
-                        mapped[field] = int(val)
-                    else:
-                        mapped[field] = Decimal(str(val)).quantize(Decimal("0.01"))
+                    mapped[field] = Decimal(str(val)).quantize(Decimal("0.01"))
                 except (ValueError, TypeError):
                     errors.append(f"Fila {row_idx}: valor inválido para '{header}' ({val!r})")
+
+        # Stock por depósito de esta fila: {deposito_id: {"cajas": n, "blisters": n}}
+        stock_fila: dict[int, dict[str, int]] = {}
+        for header, (dep_id, campo) in STOCK_COLS.items():
+            val = _cell(row, header)
+            if val is None:
+                continue
+            try:
+                stock_fila.setdefault(dep_id, {})[campo] = int(val)
+            except (ValueError, TypeError):
+                errors.append(f"Fila {row_idx}: valor inválido para '{header}' ({val!r})")
 
         try:
             result = await db.execute(select(Producto).where(Producto.codigo == codigo))
@@ -1010,12 +1017,25 @@ async def import_productos_excel(
                     setattr(existing, field, value)
                 # Sin esto, importar márgenes dejaba los precios de venta sin recalcular.
                 aplicar_a_producto(existing)
+                producto_fila = existing
                 updated += 1
             else:
                 nuevo = Producto(**mapped)
                 aplicar_a_producto(nuevo)
                 db.add(nuevo)
+                # El producto nuevo necesita id antes de poder colgarle stock.
+                await db.flush()
+                producto_fila = nuevo
                 created += 1
+
+            for dep_id, cantidades in stock_fila.items():
+                await stock_service.establecer(
+                    db,
+                    producto_fila,
+                    dep_id,
+                    cantidades.get("cajas", 0),
+                    cantidades.get("blisters", 0),
+                )
         except Exception as e:
             errors.append(f"Fila {row_idx} ({codigo}): {str(e)}")
             skipped += 1

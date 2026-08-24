@@ -18,7 +18,10 @@ class IngresoMercaderia(Base):
     )
     numero_comprobante: Mapped[str] = mapped_column(String(100), nullable=False, server_default="")
     observacion: Mapped[str | None] = mapped_column(Text, nullable=True)
-    destino: Mapped[str] = mapped_column(String(1), default="A", server_default="A", nullable=False)
+    # Depósito al que entra la mercadería (reemplaza el viejo destino "A"/"B").
+    deposito_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("depositos.id"), nullable=False, index=True
+    )
     creado_por_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("users.id"), nullable=False
     )
@@ -47,6 +50,7 @@ class IngresoMercaderia(Base):
 
     # Relationships
     proveedor: Mapped["Proveedor | None"] = relationship("Proveedor", lazy="noload")  # noqa: F821
+    deposito: Mapped["Deposito"] = relationship("Deposito", lazy="selectin")  # noqa: F821
     creado_por: Mapped["User"] = relationship("User", lazy="noload")  # noqa: F821
     items: Mapped[list["IngresoMercaderiaItem"]] = relationship(
         "IngresoMercaderiaItem", back_populates="ingreso", lazy="noload", cascade="all, delete-orphan"

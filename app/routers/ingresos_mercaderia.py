@@ -15,6 +15,8 @@ from app.models.producto import Producto
 from app.models.proveedor import Proveedor
 from app.models.ingreso_mercaderia import IngresoMercaderia, IngresoMercaderiaItem, IngresoImpuesto
 from app.models.pago_proveedor import PagoProveedorImputacion
+from app.models.movimiento_stock import MovimientoStock
+from app.services import stock_service
 from app.schemas.ingreso_mercaderia import (
     IngresoImputacionResponse,
     IngresoImpuestoResponse,
@@ -67,7 +69,8 @@ def _build_response(ingreso: IngresoMercaderia) -> IngresoMercaderiaResponse:
         id=ingreso.id,
         numero=ingreso.numero,
         fecha=ingreso.fecha,
-        destino=ingreso.destino or "A",
+        deposito_id=ingreso.deposito_id,
+        deposito_nombre=ingreso.deposito.nombre if ingreso.deposito else None,
         proveedor_id=ingreso.proveedor_id,
         proveedor_nombre=ingreso.proveedor.nombre if ingreso.proveedor else None,
         numero_comprobante=ingreso.numero_comprobante or "",
@@ -159,6 +162,8 @@ async def create_ingreso(
     next_num = int(max_num.replace("ING-", "")) + 1 if max_num else 1
     numero = f"ING-{next_num:05d}"
 
+    deposito = await stock_service.validar_deposito(db, body.deposito_id)
+
     ingreso = IngresoMercaderia(
         numero=numero,
         fecha=body.fecha,
@@ -168,7 +173,7 @@ async def create_ingreso(
         creado_por_id=current_user.id,
         fecha_vencimiento=body.fecha_vencimiento,
         dias_plazo=body.dias_plazo,
-        destino=body.destino.upper(),
+        deposito_id=deposito.id,
     )
 
     # Auto-calculate fecha_vencimiento if not provided but dias_plazo exists
@@ -188,15 +193,27 @@ async def create_ingreso(
         if not producto:
             raise HTTPException(status_code=404, detail=f"Producto id {item_data.producto_id} no encontrado")
 
-        # Update Stock
-        if body.destino.upper() == "B":
-            producto.modify_stock_b(item_data.cantidad_cajas, item_data.cantidad_blisters)
-        else:
-            producto.modify_stock_a(item_data.cantidad_cajas, item_data.cantidad_blisters)
+        # La mercadería entra al depósito elegido en la cabecera del ingreso.
+        await stock_service.ajustar(
+            db, producto, deposito.id, item_data.cantidad_cajas, item_data.cantidad_blisters
+        )
+        db.add(
+            MovimientoStock(
+                producto_id=producto.id,
+                usuario_id=current_user.id,
+                tipo_operacion="INGRESO",
+                deposito_destino_id=deposito.id,
+                cantidad_cajas=item_data.cantidad_cajas,
+                cantidad_blisters=item_data.cantidad_blisters,
+                observacion=f"Ingreso {ingreso.numero}",
+            )
+        )
 
         # Neto del renglón: costo por caja contemplando también los blisters (fracción de caja).
         costo_unit = Decimal(str(item_data.costo_unitario)) if item_data.costo_unitario else Decimal("0")
-        blisters_por_caja = Decimal(str(producto.get_blisters_por_caja() or 1))
+        # get_blisters_por_caja es una property: llamarla como función reventaba
+        # con TypeError en todo ingreso que tuviera renglones.
+        blisters_por_caja = Decimal(str(producto.get_blisters_por_caja))
         cantidad_en_cajas = Decimal(item_data.cantidad_cajas) + (
             Decimal(item_data.cantidad_blisters) / blisters_por_caja if blisters_por_caja else Decimal("0")
         )
@@ -261,7 +278,7 @@ async def eliminar_todos_ingresos(
 
     Operación destructiva e irreversible. Deja el estado consistente:
     - Si `revertir_stock` (por defecto), descuenta del stock las cantidades que cada
-      compra había ingresado (según su destino A/B).
+      compra había ingresado (según su depósito).
     - Resta del `saldo_remito` de cada proveedor el `importe_total` que la compra le había sumado.
 
     Nota: no borra los pagos a proveedor (`pagos_proveedor`); solo desvincula sus
@@ -286,14 +303,17 @@ async def eliminar_todos_ingresos(
     proveedor_deltas: dict[int, Decimal] = {}
     for ing in ingresos:
         if revertir_stock:
-            destino_b = (ing.destino or "A").upper() == "B"
             for item in ing.items:
                 if not item.producto:
                     continue
-                if destino_b:
-                    item.producto.modify_stock_b(-item.cantidad_cajas, -item.cantidad_blisters)
-                else:
-                    item.producto.modify_stock_a(-item.cantidad_cajas, -item.cantidad_blisters)
+                # Sale del mismo depósito al que había entrado.
+                await stock_service.ajustar(
+                    db,
+                    item.producto,
+                    ing.deposito_id,
+                    -item.cantidad_cajas,
+                    -item.cantidad_blisters,
+                )
         if ing.proveedor_id:
             proveedor_deltas[ing.proveedor_id] = (
                 proveedor_deltas.get(ing.proveedor_id, Decimal("0")) + (ing.importe_total or Decimal("0"))
@@ -334,7 +354,7 @@ async def get_ingreso_pdf(
         "numero": ingreso.numero,
         "fecha": str(ingreso.fecha),
         "numero_comprobante": ingreso.numero_comprobante,
-        "destino": ingreso.destino,
+        "deposito": ingreso.deposito.nombre if ingreso.deposito else None,
         "observacion": ingreso.observacion,
         "dias_plazo": ingreso.dias_plazo,
         "fecha_vencimiento": str(ingreso.fecha_vencimiento)[:10] if ingreso.fecha_vencimiento else None,

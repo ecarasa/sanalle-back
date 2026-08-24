@@ -61,7 +61,7 @@ class IngresoMercaderiaBase(BaseModel):
 
 
 class IngresoMercaderiaCreate(IngresoMercaderiaBase):
-    destino: str = "A"  # "A" o "B" para Stock Blanco/Negro
+    deposito_id: int  # depósito al que entra la mercadería
     items: list[IngresoMercaderiaItemCreate]
     impuestos: list[IngresoImpuestoCreate] = []
 
@@ -69,7 +69,8 @@ class IngresoMercaderiaCreate(IngresoMercaderiaBase):
 class IngresoMercaderiaResponse(IngresoMercaderiaBase):
     id: int
     numero: str
-    destino: str = "A"
+    deposito_id: int
+    deposito_nombre: Optional[str] = None
     creado_por_id: int
     creado_por_nombre: Optional[str] = None
     proveedor_nombre: Optional[str] = None

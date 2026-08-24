@@ -37,6 +37,16 @@ async def init() -> bool:
             await conn.run_sync(Base.metadata.create_all)
             print("[init_db] All tables created.", flush=True)
 
+            # Sin al menos un depósito no se puede vender ni ingresar mercadería:
+            # todo movimiento de stock apunta a uno. En una base migrada los crea
+            # la migración; acá, que saltea las migraciones, hay que sembrarlos.
+            await conn.execute(text(
+                "INSERT INTO depositos (nombre, activo, orden) "
+                "VALUES ('Sanalle', true, 1), ('Farmacare', true, 2) "
+                "ON CONFLICT (nombre) DO NOTHING"
+            ))
+            print("[init_db] Depósitos por defecto creados.", flush=True)
+
     await engine.dispose()
     return is_fresh
 

@@ -17,17 +17,8 @@ class Producto(Base):
 
     foto_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     
-    # DB-02: Fractional Dual Stock fields
-    stock_a_cajas: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-    stock_a_blisters: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-    stock_reservado_a_cajas: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-    stock_reservado_a_blisters: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-
-    stock_b_cajas: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-    stock_b_blisters: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-    stock_reservado_b_cajas: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-    stock_reservado_b_blisters: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-
+    # El stock vive en stock_producto_deposito (una fila por depósito). Acá solo
+    # queda el mínimo de reposición, que es del producto y no de un depósito.
     stock_minimo_cajas: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     stock_minimo_blisters: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
@@ -98,41 +89,8 @@ class Producto(Base):
     # Helpers matematicos para stock fraccionario
     @property
     def get_blisters_por_caja(self) -> int:
+        """Blísters que entran en una caja. Nunca 0: sin dato, la caja es la unidad."""
         return self.blisters_por_caja if self.blisters_por_caja and self.blisters_por_caja > 0 else 1
-
-    @property
-    def total_blisters_a(self) -> int:
-        return (self.stock_a_cajas * self.get_blisters_por_caja) + self.stock_a_blisters
-
-    @property
-    def total_blisters_b(self) -> int:
-        return (self.stock_b_cajas * self.get_blisters_por_caja) + self.stock_b_blisters
-
-    def modify_stock_a(self, cajas: int, blisters: int, is_reservation: bool = False):
-        change = (cajas * self.get_blisters_por_caja) + blisters
-        if is_reservation:
-            curr = (self.stock_reservado_a_cajas * self.get_blisters_por_caja) + self.stock_reservado_a_blisters
-            new_val = curr + change
-            self.stock_reservado_a_cajas = new_val // self.get_blisters_por_caja
-            self.stock_reservado_a_blisters = new_val % self.get_blisters_por_caja
-        else:
-            curr = self.total_blisters_a
-            new_val = curr + change
-            self.stock_a_cajas = new_val // self.get_blisters_por_caja
-            self.stock_a_blisters = new_val % self.get_blisters_por_caja
-
-    def modify_stock_b(self, cajas: int, blisters: int, is_reservation: bool = False):
-        change = (cajas * self.get_blisters_por_caja) + blisters
-        if is_reservation:
-            curr = (self.stock_reservado_b_cajas * self.get_blisters_por_caja) + self.stock_reservado_b_blisters
-            new_val = curr + change
-            self.stock_reservado_b_cajas = new_val // self.get_blisters_por_caja
-            self.stock_reservado_b_blisters = new_val % self.get_blisters_por_caja
-        else:
-            curr = self.total_blisters_b
-            new_val = curr + change
-            self.stock_b_cajas = new_val // self.get_blisters_por_caja
-            self.stock_b_blisters = new_val % self.get_blisters_por_caja
 
     @property
     def rentabilidad(self) -> Decimal | None:
@@ -182,40 +140,3 @@ def pvp_initial_history_listener(mapper, connection, target):
                 fecha_cambio=datetime.now()
             )
         )
-
-
-# --- Dual-write: sincroniza el stock por depósito (tabla nueva) cuando cambia A/B ---
-
-_STOCK_FIELDS = ("stock_a_cajas", "stock_a_blisters", "stock_b_cajas", "stock_b_blisters")
-
-
-def _sync_stock_deposito(connection, target):
-    """Upsert de los depósitos legacy (a/b) con el stock actual A/B del producto."""
-    from sqlalchemy import text
-    for legacy, cajas, blisters in (
-        ("a", target.stock_a_cajas, target.stock_a_blisters),
-        ("b", target.stock_b_cajas, target.stock_b_blisters),
-    ):
-        connection.execute(
-            text(
-                """
-                INSERT INTO stock_producto_deposito (producto_id, deposito_id, cajas, blisters)
-                SELECT :pid, d.id, :cajas, :blisters FROM depositos d WHERE d.stock_legacy = :legacy
-                ON CONFLICT (producto_id, deposito_id)
-                DO UPDATE SET cajas = EXCLUDED.cajas, blisters = EXCLUDED.blisters
-                """
-            ),
-            {"pid": target.id, "cajas": cajas, "blisters": blisters, "legacy": legacy},
-        )
-
-
-@event.listens_for(Producto, "before_update")
-def sync_stock_deposito_on_update(mapper, connection, target):
-    state = inspect(target)
-    if any(state.get_history(f, True).has_changes() for f in _STOCK_FIELDS):
-        _sync_stock_deposito(connection, target)
-
-
-@event.listens_for(Producto, "after_insert")
-def sync_stock_deposito_on_insert(mapper, connection, target):
-    _sync_stock_deposito(connection, target)

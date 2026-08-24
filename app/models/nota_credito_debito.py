@@ -44,9 +44,10 @@ class NotaCreditoDebito(Base):
     afecta_stock: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False
     )
-    stock_tipo: Mapped[str | None] = mapped_column(
-        String(10), nullable=True
-    )  # "A" o "B"
+    # Depósito afectado cuando la nota mueve stock (reemplaza stock_tipo "A"/"B").
+    deposito_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("depositos.id"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -55,6 +56,7 @@ class NotaCreditoDebito(Base):
     cliente: Mapped["Cliente"] = relationship("Cliente", lazy="noload")  # noqa: F821
     pedido: Mapped["Pedido | None"] = relationship("Pedido", lazy="noload")  # noqa: F821
     creado_por: Mapped["User"] = relationship("User", lazy="noload")  # noqa: F821
+    deposito: Mapped["Deposito | None"] = relationship("Deposito", lazy="selectin")  # noqa: F821
     items: Mapped[list["NotaCreditoItem"]] = relationship(
         "NotaCreditoItem", back_populates="nota", lazy="noload", cascade="all, delete-orphan"
     )

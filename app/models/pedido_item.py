@@ -17,6 +17,12 @@ class PedidoItem(Base):
     producto_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("productos.id"), nullable=False, index=True
     )
+    # Depósito del que sale esta línea. Es lo que le dice a depósito de qué
+    # góndola pickear, y contra qué fila de stock se reservó/descontó.
+    # Nullable solo por los pedidos anteriores a los depósitos por línea.
+    deposito_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("depositos.id"), nullable=True, index=True
+    )
     cantidad_cajas: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     cantidad_blisters: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # Unidad en la que se vendió la línea: 'caja' | 'blister'.
@@ -36,6 +42,9 @@ class PedidoItem(Base):
     )
     producto: Mapped["Producto"] = relationship(  # noqa: F821
         "Producto", lazy="noload"
+    )
+    deposito: Mapped["Deposito | None"] = relationship(  # noqa: F821
+        "Deposito", lazy="selectin"
     )
     comision_vendedor: Mapped[Decimal] = mapped_column(Numeric(12, 2), server_default="0", nullable=False)
 

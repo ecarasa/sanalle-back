@@ -592,6 +592,7 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
         ("ENTREGA", fecha_ent),
         ("VENDEDOR", str(vendedor_nombre or '-')),
         ("TRANSPORTE", str(pedido_data.get('transporte') or '-')),
+        ("DEPÓSITO", ", ".join(pedido_data.get('depositos') or []) or '-'),
         ("DESPACHO", _estado_badge(shipping)),
         ("PAGO", _estado_badge(payment)),
     ]
@@ -619,6 +620,16 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
         plural = f"{label}s" if cant != 1 else label
         return f"{cant} {plural}"
 
+    # Si todo el pedido sale del mismo depósito ya está en la cabecera; solo se
+    # repite por renglón cuando hay más de uno y hace falta desglosar el picking.
+    varios_depositos = len({i.get('deposito') for i in items if i.get('deposito')}) > 1
+
+    def _nombre_producto(item: dict) -> str:
+        nombre = str(item.get('producto_nombre', ''))
+        if varios_depositos and item.get('deposito'):
+            nombre += f'<br/><font size=7 color="#666666">Depósito: {item["deposito"]}</font>'
+        return nombre
+
     has_discount = any(item.get('descuento_porcentaje') for item in items)
 
     if has_discount:
@@ -634,7 +645,7 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
         for item in items:
             desc = item.get('descuento_porcentaje')
             rows.append([
-                Paragraph(str(item.get('producto_nombre', '')), s["normal_sm"]),
+                Paragraph(_nombre_producto(item), s["normal_sm"]),
                 Paragraph(_cant_unidad(item), ParagraphStyle('_c', parent=s["normal_sm"], alignment=TA_CENTER)),
                 Paragraph(f"$ {float(item.get('precio_lista') or item.get('precio_unitario', 0)):,.2f}", ParagraphStyle('_r', parent=s["normal_sm"], alignment=TA_RIGHT)),
                 Paragraph(f"{float(desc):.1f}%" if desc else "-", ParagraphStyle('_c2', parent=s["normal_sm"], alignment=TA_CENTER)),
@@ -652,7 +663,7 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
         rows = [header_row]
         for item in items:
             rows.append([
-                Paragraph(str(item.get('producto_nombre', '')), s["normal_sm"]),
+                Paragraph(_nombre_producto(item), s["normal_sm"]),
                 Paragraph(_cant_unidad(item), ParagraphStyle('_c', parent=s["normal_sm"], alignment=TA_CENTER)),
                 Paragraph(f"$ {float(item.get('precio_unitario', 0)):,.2f}", ParagraphStyle('_r', parent=s["normal_sm"], alignment=TA_RIGHT)),
                 Paragraph(f"$ {float(item.get('precio_total', 0)):,.2f}", ParagraphStyle('_r2', parent=s["normal_sm"], alignment=TA_RIGHT)),
@@ -769,7 +780,9 @@ def generate_hoja_ruta_pdf(fecha: str, paradas: list[dict]) -> str:
         if tel:
             cliente_dir += f"<br/>Tel: {tel}"
         items_txt = "<br/>".join(
-            f"{it['cantidad']} {it['unidad']} — {it['producto']}" for it in p.get('items', [])
+            f"{it['cantidad']} {it['unidad']} — {it['producto']}"
+            + (f' <font size=7 color="#666666">[{it["deposito"]}]</font>' if it.get('deposito') else "")
+            for it in p.get('items', [])
         ) or "-"
         rows.append([
             Paragraph(str(p.get('orden', '')), orden_st),

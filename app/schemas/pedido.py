@@ -8,6 +8,9 @@ from pydantic import BaseModel, Field, field_validator
 
 class PedidoItemBase(BaseModel):
     producto_id: int
+    # Depósito del que sale la línea. Si viene vacío se usa el del pedido; que no
+    # haya ninguno de los dos es un error, no un default silencioso.
+    deposito_id: Optional[int] = None
     cantidad_cajas: int = Field(0, ge=0)
     cantidad_blisters: int = Field(0, ge=0)
     cantidad: Optional[int] = None  # Generic quantity (mapped to the sale unit)
@@ -26,6 +29,7 @@ class PedidoItemCreate(PedidoItemBase):
 
 class PedidoItemResponse(PedidoItemBase):
     id: int
+    deposito_nombre: Optional[str] = None
     producto_nombre: Optional[str] = None
     presentacion: Optional[str] = None
     blisters_por_caja: Optional[int] = None
@@ -47,7 +51,9 @@ class PedidoBase(BaseModel):
     direccion_entrega: Optional[str] = None  # envío: por defecto el domicilio del cliente, editable
     fecha_compromiso_pago: Optional[date] = None
     despachado: bool = False
-    sociedad: Optional[str] = None  # "sanalle" | "farmacare"
+    sociedad: Optional[str] = None  # "sanalle" | "farmacare" — solo facturación
+    # Depósito por defecto del pedido: se aplica a las líneas que no traen uno propio.
+    deposito_id: Optional[int] = None
     tipo_precio: Optional[str] = "minorista"
     bultos: Optional[int] = 0
 
@@ -69,6 +75,7 @@ class PedidoUpdate(BaseModel):
     fecha_compromiso_pago: Optional[date] = None
     despachado: Optional[bool] = None
     sociedad: Optional[str] = None
+    deposito_id: Optional[int] = None
     tipo_precio: Optional[str] = None
     vendedor_id: Optional[int] = None
     bultos: Optional[int] = None
@@ -110,6 +117,9 @@ class PedidoResponse(BaseModel):
     fecha_compromiso_pago: Optional[date] = None
     despachado: bool = False
     sociedad: Optional[str] = None
+    # Depósitos involucrados, ya resueltos a nombre. Normalmente uno solo; son
+    # varios cuando una línea se tomó de otro depósito por falta de stock.
+    depositos: list[str] = []
     tipo_precio: Optional[str] = None
     importe_total: float
     saldo_pendiente: float

@@ -15,8 +15,6 @@ class Deposito(Base):
     nombre: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     activo: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
     orden: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
-    # Mapeo con las columnas viejas de stock: 'a', 'b' o None (depósito nuevo).
-    stock_legacy: Mapped[str | None] = mapped_column(String(1), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

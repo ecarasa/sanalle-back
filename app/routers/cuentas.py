@@ -60,14 +60,18 @@ async def _balance_y_movimientos(db: AsyncSession, cuenta_id: int) -> tuple[Deci
     """Balance real de una cuenta = cobros de cliente recibidos - pagos a proveedor
     salidos por esa cuenta. Las notas de crédito/débito no mueven caja de una cuenta
     puntual, así que no se incluyen acá."""
+    # Los pagos puente (pasamanos) son tránsito: no impactan la caja real de la cuenta.
     ingresos_total = (await db.execute(
         select(func.coalesce(func.sum(Pago.importe), 0)).where(
-            Pago.cuenta_id == cuenta_id, Pago.estado != EstadoPago.rechazado
+            Pago.cuenta_id == cuenta_id, Pago.estado != EstadoPago.rechazado, Pago.es_puente.is_(False)
         )
     )).scalar_one()
     egresos_total = (await db.execute(
-        select(func.coalesce(func.sum(PagoProveedor.importe), 0)).where(
-            PagoProveedor.cuenta_id == cuenta_id
+        select(func.coalesce(func.sum(PagoProveedor.importe), 0))
+        .join(Pago, Pago.id == PagoProveedor.pago_id, isouter=True)
+        .where(
+            PagoProveedor.cuenta_id == cuenta_id,
+            (Pago.id.is_(None)) | (Pago.es_puente.is_(False)),
         )
     )).scalar_one()
     balance = Decimal(str(ingresos_total)) - Decimal(str(egresos_total))
@@ -75,14 +79,18 @@ async def _balance_y_movimientos(db: AsyncSession, cuenta_id: int) -> tuple[Deci
     ingresos_rows = (await db.execute(
         select(Pago.importe, Pago.fecha_recepcion, Pago.numero_recibo, Cliente.nombre)
         .join(Cliente, Cliente.id == Pago.cliente_id)
-        .where(Pago.cuenta_id == cuenta_id, Pago.estado != EstadoPago.rechazado)
+        .where(Pago.cuenta_id == cuenta_id, Pago.estado != EstadoPago.rechazado, Pago.es_puente.is_(False))
         .order_by(Pago.fecha_recepcion.desc())
         .limit(5)
     )).all()
     egresos_rows = (await db.execute(
         select(PagoProveedor.importe, PagoProveedor.fecha_pago, PagoProveedor.referencia_pago, Proveedor.nombre)
         .join(Proveedor, Proveedor.id == PagoProveedor.proveedor_id)
-        .where(PagoProveedor.cuenta_id == cuenta_id)
+        .join(Pago, Pago.id == PagoProveedor.pago_id, isouter=True)
+        .where(
+            PagoProveedor.cuenta_id == cuenta_id,
+            (Pago.id.is_(None)) | (Pago.es_puente.is_(False)),
+        )
         .order_by(PagoProveedor.fecha_pago.desc())
         .limit(5)
     )).all()

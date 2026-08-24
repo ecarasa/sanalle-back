@@ -17,10 +17,6 @@ class ProductoBase(BaseModel):
         return v.strip().title() if v else v
 
     foto_url: Optional[str] = None
-    stock_a_cajas: int = 0
-    stock_a_blisters: int = 0
-    stock_b_cajas: int = 0
-    stock_b_blisters: int = 0
     stock_minimo_cajas: int = 0
     stock_minimo_blisters: int = 0
     categoria_producto: Optional[str] = None
@@ -58,10 +54,6 @@ class ProductoUpdate(BaseModel):
     codigo: Optional[str] = None
     nombre: Optional[str] = None
     foto_url: Optional[str] = None
-    stock_a_cajas: Optional[int] = None
-    stock_a_blisters: Optional[int] = None
-    stock_b_cajas: Optional[int] = None
-    stock_b_blisters: Optional[int] = None
     stock_minimo_cajas: Optional[int] = None
     stock_minimo_blisters: Optional[int] = None
     categoria_producto: Optional[str] = None
@@ -89,14 +81,24 @@ class ProductoUpdate(BaseModel):
     pvp_descripcion: Optional[str] = None
 
 
+class StockDepositoResponse(BaseModel):
+    """Stock del producto en un depósito. `total_blisters` es lo vendible."""
+
+    deposito_id: int
+    nombre: Optional[str] = None
+    orden: int = 0
+    activo: bool = True
+    cajas: int = 0
+    blisters: int = 0
+    reservado_cajas: int = 0
+    reservado_blisters: int = 0
+    total_blisters: int = 0
+    reservado_total_blisters: int = 0
+
+
 class ProductoResponse(ProductoBase):
     id: int
-    stock_reservado_a_cajas: int = 0
-    stock_reservado_a_blisters: int = 0
-    stock_reservado_b_cajas: int = 0
-    stock_reservado_b_blisters: int = 0
-    total_blisters_a: Optional[int] = None
-    total_blisters_b: Optional[int] = None
+    stocks: list[StockDepositoResponse] = []
     proveedor_nombre: Optional[str] = None
     laboratorio_nombre: Optional[str] = None
     created_at: datetime
@@ -118,8 +120,8 @@ class ProductoPublicResponse(BaseModel):
     codigo: str
     nombre: str
     foto_url: Optional[str] = None
-    stock_a_cajas: int = 0
-    stock_b_cajas: int = 0
+    # Total de cajas sumando depósitos: al cliente solo le importa si hay o no.
+    stock_total_cajas: int = 0
     categoria_producto: Optional[str] = None
     presentacion: Optional[str] = None
     comprimidos_por_blister: Optional[int] = None

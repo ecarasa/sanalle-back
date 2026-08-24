@@ -30,7 +30,8 @@ class NotaCreditoDebitoBase(BaseModel):
     pedido_id: Optional[int] = None
     tipo_cuenta: str = "remito"
     afecta_stock: bool = False
-    stock_tipo: Optional[str] = None
+    # Depósito afectado. Obligatorio cuando afecta_stock=True.
+    deposito_id: Optional[int] = None
 
 
 class NotaCreditoDebitoCreate(NotaCreditoDebitoBase):
@@ -40,6 +41,7 @@ class NotaCreditoDebitoCreate(NotaCreditoDebitoBase):
 class NotaCreditoDebitoResponse(NotaCreditoDebitoBase):
     id: int
     numero: str
+    deposito_nombre: Optional[str] = None
     importe_total: float
     creado_por_id: int
     creado_por_nombre: Optional[str] = None

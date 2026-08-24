@@ -11,6 +11,7 @@ from app.models.nota_credito_debito import NotaCreditoDebito, NotaCreditoItem, T
 from app.models.producto import Producto
 from app.models.movimiento_stock import MovimientoStock
 from app.models.pago import TipoCuenta
+from app.services import stock_service
 from app.schemas.nota_credito_debito import (
     NotaCreditoDebitoCreate,
     NotaCreditoDebitoResponse,
@@ -48,7 +49,8 @@ def _build_response(nota: NotaCreditoDebito) -> NotaCreditoDebitoResponse:
         creado_por_nombre=nota.creado_por.nombre_completo if nota.creado_por else None,
         tipo_cuenta=nota.tipo_cuenta.value,
         afecta_stock=nota.afecta_stock,
-        stock_tipo=nota.stock_tipo,
+        deposito_id=nota.deposito_id,
+        deposito_nombre=nota.deposito.nombre if nota.deposito else None,
         items=items,
         created_at=nota.created_at,
     )
@@ -161,6 +163,12 @@ async def create_nota(
     # Calculate total from items
     importe_total = sum(Decimal(str(item.precio_total)) for item in body.items)
 
+    # Una nota que mueve stock tiene que decir de qué depósito lo mueve; si no,
+    # no habría forma de saber a qué góndola vuelve la devolución.
+    deposito_id = None
+    if body.afecta_stock:
+        deposito_id = (await stock_service.validar_deposito(db, body.deposito_id)).id
+
     nota = NotaCreditoDebito(
         numero=numero,
         tipo=tipo_enum,
@@ -172,7 +180,7 @@ async def create_nota(
         creado_por_id=current_user.id,
         tipo_cuenta=tipo_cuenta_enum,
         afecta_stock=body.afecta_stock,
-        stock_tipo=body.stock_tipo,
+        deposito_id=deposito_id,
     )
     db.add(nota)
     await db.flush()
@@ -195,30 +203,30 @@ async def create_nota(
             prod_res = await db.execute(select(Producto).where(Producto.id == item_data.producto_id))
             producto = prod_res.scalar_one_or_none()
             if producto:
-                # If Nota de Credito -> Increase stock (return)
-                # If Nota de Debito -> Decrease stock (extra charge/shipment)
-                multiplier = 1 if tipo_enum == TipoNota.credito else -1
-                cajas_change = item_data.cantidad_cajas * multiplier
-                blisters_change = item_data.cantidad_blisters * multiplier
-                
-                if body.stock_tipo == "A":
-                    producto.modify_stock_a(cajas_change, blisters_change)
-                else:
-                    producto.modify_stock_b(cajas_change, blisters_change)
-                
-                # Create stock movement record
-                mov_tipo = "NC_RETURN" if tipo_enum == TipoNota.credito else "ND_ADJUST"
-                mov_stock = MovimientoStock(
-                    producto_id=producto.id,
-                    usuario_id=current_user.id,
-                    tipo_operacion=mov_tipo,
-                    origen="NONE" if tipo_enum == TipoNota.credito else f"STOCK_{body.stock_tipo}",
-                    destino=f"STOCK_{body.stock_tipo}" if tipo_enum == TipoNota.credito else "NONE",
-                    cantidad_cajas=item_data.cantidad_cajas,
-                    cantidad_blisters=item_data.cantidad_blisters,
-                    observacion=f"{prefix} {numero}: {body.motivo or ''}"
+                # Nota de crédito = devolución: la mercadería vuelve al depósito.
+                # Nota de débito = salida extra: sale del depósito.
+                es_credito = tipo_enum == TipoNota.credito
+                multiplier = 1 if es_credito else -1
+                await stock_service.ajustar(
+                    db,
+                    producto,
+                    deposito_id,
+                    item_data.cantidad_cajas * multiplier,
+                    item_data.cantidad_blisters * multiplier,
                 )
-                db.add(mov_stock)
+
+                db.add(
+                    MovimientoStock(
+                        producto_id=producto.id,
+                        usuario_id=current_user.id,
+                        tipo_operacion="NC_RETURN" if es_credito else "ND_ADJUST",
+                        deposito_origen_id=None if es_credito else deposito_id,
+                        deposito_destino_id=deposito_id if es_credito else None,
+                        cantidad_cajas=item_data.cantidad_cajas,
+                        cantidad_blisters=item_data.cantidad_blisters,
+                        observacion=f"{prefix} {numero}: {body.motivo or ''}",
+                    )
+                )
 
     await db.commit()
 

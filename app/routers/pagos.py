@@ -305,11 +305,15 @@ async def create_pago(
 
     fecha_recepcion = body.fecha_recepcion if body.fecha_recepcion else datetime.now(timezone.utc)
 
-    # Cuenta: la elegida, o la cuenta por defecto de la empresa.
-    from app.routers.cuentas import asegurar_default
-    cuenta_id = body.cuenta_id
-    if not cuenta_id:
-        cuenta_id = (await asegurar_default(db)).id
+    # Cuenta: la elegida, o la cuenta por defecto de la empresa. Pasamanos (cuenta
+    # puente) no queda asociado a ninguna cuenta real, es tránsito.
+    if body.es_puente:
+        cuenta_id = body.cuenta_id
+    else:
+        from app.routers.cuentas import asegurar_default
+        cuenta_id = body.cuenta_id
+        if not cuenta_id:
+            cuenta_id = (await asegurar_default(db)).id
 
     pago = Pago(
         cliente_id=body.cliente_id,
@@ -481,8 +485,12 @@ async def registrar_pago_pedido(
 
     fecha_recepcion = body.fecha_recepcion or datetime.now(timezone.utc)
 
-    from app.routers.cuentas import asegurar_default
-    cuenta_id = body.cuenta_id or (await asegurar_default(db)).id
+    # Pasamanos (cuenta puente): no queda asociado a ninguna cuenta real, es tránsito.
+    if body.es_puente:
+        cuenta_id = body.cuenta_id
+    else:
+        from app.routers.cuentas import asegurar_default
+        cuenta_id = body.cuenta_id or (await asegurar_default(db)).id
 
     importe_decimal = Decimal(str(body.importe))
     pago = Pago(

@@ -52,6 +52,7 @@ from app.services.bitacora_service import (
 from app.services.pdf_service import generate_pedido_pdf, generate_hoja_ruta_pdf
 from app.services.pago_service import imputar_pagos_a_pedido
 from app.services.pricing_service import LISTAS
+from app.services import stock_service
 from app.services.semaforo_service import calcular_semaforo_pedido
 from app.utils.deps import get_current_user, require_role
 from app.utils.filters import apply_column_filters
@@ -162,7 +163,7 @@ def _resolver_cantidades(item_data, producto: Producto) -> tuple[int, int, str]:
     """Resuelve (cajas, blisters, unidad_venta) según el formato de venta de la línea.
 
     - unidad 'blister': `cantidad` son blísters -> cajas=0, blisters=cantidad.
-      El stock se descuenta en blísters (modify_stock fracciona la caja).
+      El stock se descuenta en blísters (stock_service fracciona la caja).
     - unidad 'caja' (default): comportamiento clásico, `cantidad` son cajas.
 
     Valida contra los formatos habilitados del producto (vende_caja / vende_blister).
@@ -191,23 +192,46 @@ def _resolver_cantidades(item_data, producto: Producto) -> tuple[int, int, str]:
     return int(cajas or 0), int(item_data.cantidad_blisters or 0), "caja"
 
 
-def _validar_stock_disponible(producto: Producto, cajas: int, blisters: int, es_sanalle: bool) -> None:
-    """Bloquea la línea si pide más de lo que hay disponible en el depósito correspondiente.
+async def _mover_reservas_pedido(db: AsyncSession, pedido: Pedido, *, devolver: bool) -> None:
+    """Cierra las reservas de todas las líneas del pedido.
 
-    Se llama justo antes de descontar stock (nunca después), así una línea sin stock
-    no llega a mutar nada y el pedido completo se rechaza con 400.
+    `devolver=False` es la entrega: la mercadería salió, la reserva se consume y
+    el stock físico (que ya bajó al crear el pedido) no vuelve.
+    `devolver=True` es cancelar o borrar: la reserva vuelve a ser stock vendible
+    en el depósito del que había salido cada línea.
+
+    Las líneas sin depósito son pedidos viejos anteriores a esta función; se saltean
+    en vez de adivinar un depósito y descuadrar el stock de uno que no corresponde.
     """
-    pedido_blisters = cajas * producto.get_blisters_por_caja + blisters
-    disponible_blisters = producto.total_blisters_a if es_sanalle else producto.total_blisters_b
-    if pedido_blisters > disponible_blisters:
-        disponible_cajas = disponible_blisters // producto.get_blisters_por_caja
+    for item in pedido.items:
+        if not item.deposito_id:
+            continue
+        producto = (
+            await db.execute(
+                select(Producto).where(Producto.id == item.producto_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if producto is None:
+            continue
+        mover = stock_service.liberar_reserva if devolver else stock_service.consumir_reserva
+        await mover(db, producto, item.deposito_id, item.cantidad_cajas, item.cantidad_blisters)
+
+
+async def _resolver_deposito(db: AsyncSession, item_data, deposito_pedido_id: int | None) -> int:
+    """Depósito del que sale una línea.
+
+    Prioridad: el que la línea trae explícito, si no el del pedido. Si no hay
+    ninguno la venta se rechaza: sin depósito no sabríamos de qué stock descontar
+    ni qué tiene que pickear depósito.
+    """
+    deposito_id = getattr(item_data, "deposito_id", None) or deposito_pedido_id
+    dep = await stock_service.validar_deposito(db, deposito_id)
+    if not dep.activo:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Stock insuficiente para {producto.nombre}: disponible {disponible_cajas} caja(s) "
-                f"({disponible_blisters} blísters), pedido supera lo disponible."
-            ),
+            detail=f"El depósito {dep.nombre} está inactivo: no se puede vender desde ahí.",
         )
+    return dep.id
 
 
 def _build_item_response(item: PedidoItem) -> PedidoItemResponse:
@@ -227,6 +251,8 @@ def _build_item_response(item: PedidoItem) -> PedidoItemResponse:
     return PedidoItemResponse(
         id=item.id,
         producto_id=item.producto_id,
+        deposito_id=item.deposito_id,
+        deposito_nombre=item.deposito.nombre if item.deposito else None,
         cantidad_cajas=item.cantidad_cajas,
         cantidad_blisters=item.cantidad_blisters,
         # `cantidad` = cantidad en la unidad de venta (blísters si se vendió por blíster),
@@ -243,6 +269,16 @@ def _build_item_response(item: PedidoItem) -> PedidoItemResponse:
         margen=margen,
         producto_precios=producto_precios,
     )
+
+
+def _depositos_de(pedido: Pedido) -> list[str]:
+    """Nombres de los depósitos de los que sale el pedido, sin repetir y en orden."""
+    nombres: list[str] = []
+    for item in pedido.items:
+        nombre = item.deposito.nombre if item.deposito else None
+        if nombre and nombre not in nombres:
+            nombres.append(nombre)
+    return nombres
 
 
 def _build_pedido_response(pedido: Pedido) -> PedidoResponse:
@@ -275,6 +311,7 @@ def _build_pedido_response(pedido: Pedido) -> PedidoResponse:
         fecha_compromiso_pago=pedido.fecha_compromiso_pago,
         despachado=pedido.despachado,
         sociedad=pedido.sociedad,
+        depositos=_depositos_de(pedido),
         tipo_precio=pedido.tipo_precio,
         importe_total=float(pedido.importe_total),
         saldo_pendiente=float(pedido.saldo_pendiente),
@@ -767,18 +804,8 @@ async def terminar_recorrido(
         if pedido.shipping_status != EstadoDespacho.en_camino:
             errores.append({"pedido_id": pedido_id, "error": f"estado inválido: {pedido.shipping_status.value}"})
             continue
-        # Apply same stock logic as PATCH /{id}/shipping-status for en_camino → entregado
-        for item in pedido.items:
-            prod_result = await db.execute(
-                select(Producto).where(Producto.id == item.producto_id).with_for_update()
-            )
-            producto = prod_result.scalar_one_or_none()
-            if producto:
-                es_sanalle = (pedido.sociedad and pedido.sociedad.lower() == "sanalle") or (pedido.tipo_documento == TipoDocumento.factura)
-                if es_sanalle:
-                    producto.modify_stock_a(-item.cantidad_cajas, -item.cantidad_blisters, is_reservation=True)
-                else:
-                    producto.modify_stock_b(-item.cantidad_cajas, -item.cantidad_blisters, is_reservation=True)
+        # Mismo cierre de stock que PATCH /{id}/shipping-status para en_camino → entregado
+        await _mover_reservas_pedido(db, pedido, devolver=False)
         pedido.shipping_status = EstadoDespacho.entregado
         actualizados += 1
 
@@ -1009,26 +1036,21 @@ async def create_pedido(
                 detail=f"Producto con id {item_data.producto_id} no encontrado",
             )
         
-        # Deduct stock based on society (Sanalle -> A, Farmacare -> B)
-        # We assume if sociedad is None, it defaults to Farmacare or logic fallback
-        es_sanalle = (body.sociedad and body.sociedad.lower() == "sanalle") or (tipo_doc == TipoDocumento.factura)
-        
         # Resolver cantidades según el formato de venta de la línea (caja/blister)
         cajas, blisters, unidad_venta = _resolver_cantidades(item_data, producto)
-        _validar_stock_disponible(producto, cajas, blisters, es_sanalle)
-
-        if es_sanalle:
-            producto.modify_stock_a(-cajas, -blisters)
-            producto.modify_stock_a(cajas, blisters, is_reservation=True)
-        else:
-            producto.modify_stock_b(-cajas, -blisters)
-            producto.modify_stock_b(cajas, blisters, is_reservation=True)
+        # El depósito manda: de ahí sale la mercadería y contra ese stock se valida.
+        # La sociedad ya no interviene, es solo un dato de facturación.
+        deposito_id = await _resolver_deposito(db, item_data, body.deposito_id)
+        # reservar valida y mueve físico -> reservado en un solo paso; si no alcanza
+        # tira 400 sin haber tocado nada y el pedido entero se rechaza.
+        await stock_service.reservar(db, producto, deposito_id, cajas, blisters)
 
         comision = _comision_para(vendedor, producto)
 
         pedido_item = PedidoItem(
             pedido_id=pedido.id,
             producto_id=item_data.producto_id,
+            deposito_id=deposito_id,
             cantidad_cajas=cajas,
             cantidad_blisters=blisters,
             unidad_venta=unidad_venta,
@@ -1107,7 +1129,7 @@ async def update_pedido(
     items_previos = snapshot_items(pedido.items)
 
     # Update scalar fields
-    update_data = body.model_dump(exclude_unset=True, exclude={"items"})
+    update_data = body.model_dump(exclude_unset=True, exclude={"items", "deposito_id"})
     if "shipping_status" in update_data and update_data["shipping_status"] is not None:
         try:
             update_data["shipping_status"] = EstadoDespacho(update_data["shipping_status"])
@@ -1141,14 +1163,16 @@ async def update_pedido(
                 select(Producto).where(Producto.id == existing_item.producto_id).with_for_update()
             )
             producto = prod_result.scalar_one_or_none()
-            if producto:
-                es_sanalle = (pedido.sociedad and pedido.sociedad.lower() == "sanalle") or (pedido.tipo_documento == TipoDocumento.factura)
-                if es_sanalle:
-                    producto.modify_stock_a(existing_item.cantidad_cajas, existing_item.cantidad_blisters)
-                    producto.modify_stock_a(-existing_item.cantidad_cajas, -existing_item.cantidad_blisters, is_reservation=True)
-                else:
-                    producto.modify_stock_b(existing_item.cantidad_cajas, existing_item.cantidad_blisters)
-                    producto.modify_stock_b(-existing_item.cantidad_cajas, -existing_item.cantidad_blisters, is_reservation=True)
+            if producto and existing_item.deposito_id:
+                # Se devuelve al mismo depósito del que salió, no al que tenga
+                # seleccionado el pedido ahora: la mercadería está donde estaba.
+                await stock_service.liberar_reserva(
+                    db,
+                    producto,
+                    existing_item.deposito_id,
+                    existing_item.cantidad_cajas,
+                    existing_item.cantidad_blisters,
+                )
             await db.delete(existing_item)
         await db.flush()
 
@@ -1168,24 +1192,17 @@ async def update_pedido(
                     detail=f"Producto con id {item_data.producto_id} no encontrado",
                 )
             
-            es_sanalle = (pedido.sociedad and pedido.sociedad.lower() == "sanalle") or (pedido.tipo_documento == TipoDocumento.factura)
-
             # Resolver cantidades según el formato de venta de la línea (caja/blister)
             cajas, blisters, unidad_venta = _resolver_cantidades(item_data, producto)
-            _validar_stock_disponible(producto, cajas, blisters, es_sanalle)
-
-            if es_sanalle:
-                producto.modify_stock_a(-cajas, -blisters)
-                producto.modify_stock_a(cajas, blisters, is_reservation=True)
-            else:
-                producto.modify_stock_b(-cajas, -blisters)
-                producto.modify_stock_b(cajas, blisters, is_reservation=True)
+            deposito_id = await _resolver_deposito(db, item_data, body.deposito_id)
+            await stock_service.reservar(db, producto, deposito_id, cajas, blisters)
 
             comision = _comision_para(vendedor, producto)
 
             pedido_item = PedidoItem(
                 pedido_id=pedido.id,
                 producto_id=item_data.producto_id,
+                deposito_id=deposito_id,
                 cantidad_cajas=cajas,
                 cantidad_blisters=blisters,
                 unidad_venta=unidad_venta,
@@ -1285,32 +1302,9 @@ async def update_shipping_status(
 
     # Stock adjustments on shipping change
     if nuevo_shipping == EstadoDespacho.entregado:
-        for item in pedido.items:
-            prod_result = await db.execute(
-                select(Producto).where(Producto.id == item.producto_id).with_for_update()
-            )
-            producto = prod_result.scalar_one_or_none()
-            if producto:
-                es_sanalle = (pedido.sociedad and pedido.sociedad.lower() == "sanalle") or (pedido.tipo_documento == TipoDocumento.factura)
-                if es_sanalle:
-                    producto.modify_stock_a(-item.cantidad_cajas, -item.cantidad_blisters, is_reservation=True)
-                else:
-                    producto.modify_stock_b(-item.cantidad_cajas, -item.cantidad_blisters, is_reservation=True)
-
+        await _mover_reservas_pedido(db, pedido, devolver=False)
     elif nuevo_shipping == EstadoDespacho.cancelado:
-        for item in pedido.items:
-            prod_result = await db.execute(
-                select(Producto).where(Producto.id == item.producto_id).with_for_update()
-            )
-            producto = prod_result.scalar_one_or_none()
-            if producto:
-                es_sanalle = (pedido.sociedad and pedido.sociedad.lower() == "sanalle") or (pedido.tipo_documento == TipoDocumento.factura)
-                if es_sanalle:
-                    producto.modify_stock_a(item.cantidad_cajas, item.cantidad_blisters)
-                    producto.modify_stock_a(-item.cantidad_cajas, -item.cantidad_blisters, is_reservation=True)
-                else:
-                    producto.modify_stock_b(item.cantidad_cajas, item.cantidad_blisters)
-                    producto.modify_stock_b(-item.cantidad_cajas, -item.cantidad_blisters, is_reservation=True)
+        await _mover_reservas_pedido(db, pedido, devolver=True)
 
     estado_anterior = pedido.shipping_status
     pedido.shipping_status = nuevo_shipping
@@ -1564,6 +1558,7 @@ async def get_pedido_pdf(
         "payment_status": pedido.payment_status.value,
         "transporte": pedido.transporte,
         "sociedad": pedido.sociedad,
+        "depositos": _depositos_de(pedido),
         "importe_total": 0.0 if sin_valores else float(pedido.importe_total),
         "observacion": pedido.observacion,
         "tipo_documento": pedido.tipo_documento.value if pedido.tipo_documento else "remito",
@@ -1578,6 +1573,7 @@ async def get_pedido_pdf(
     items = [
         {
             "producto_nombre": item.producto.nombre if item.producto else f"Producto #{item.producto_id}",
+            "deposito": item.deposito.nombre if item.deposito else None,
             # Cantidad en la unidad de venta real (blísters si corresponde) + la unidad.
             "cantidad": item.cantidad_venta,
             "unidad_venta": item.unidad_venta,
@@ -1637,7 +1633,8 @@ async def get_hoja_ruta_pdf(
             "bultos": p.bultos or 0,
             "items": [
                 {"producto": (i.producto.nombre if i.producto else f"#{i.producto_id}"),
-                 "cantidad": i.cantidad_venta, "unidad": i.unidad_label}
+                 "cantidad": i.cantidad_venta, "unidad": i.unidad_label,
+                 "deposito": i.deposito.nombre if i.deposito else None}
                 for i in p.items
             ],
         })
@@ -1689,19 +1686,7 @@ async def delete_pedido(
         )
     await db.flush()
 
-    for item in pedido.items:
-        prod_result = await db.execute(
-            select(Producto).where(Producto.id == item.producto_id).with_for_update()
-        )
-        producto = prod_result.scalar_one_or_none()
-        if producto:
-            es_sanalle = (pedido.sociedad and pedido.sociedad.lower() == "sanalle") or (pedido.tipo_documento == TipoDocumento.factura)
-            if es_sanalle:
-                producto.modify_stock_a(item.cantidad_cajas, item.cantidad_blisters)
-                producto.modify_stock_a(-item.cantidad_cajas, -item.cantidad_blisters, is_reservation=True)
-            else:
-                producto.modify_stock_b(item.cantidad_cajas, item.cantidad_blisters)
-                producto.modify_stock_b(-item.cantidad_cajas, -item.cantidad_blisters, is_reservation=True)
+    await _mover_reservas_pedido(db, pedido, devolver=True)
 
     await db.delete(pedido)
     await db.commit()
