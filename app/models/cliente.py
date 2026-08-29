@@ -49,6 +49,11 @@ class Cliente(Base):
     latitud: Mapped[float | None] = mapped_column(Float, nullable=True)
     longitud: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Último transporte con el que se le despachó. Se actualiza solo al guardar
+    # un pedido, para no tener que retipearlo en cada uno; sigue siendo editable
+    # acá y por pedido.
+    transporte_habitual: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -71,6 +76,12 @@ class Cliente(Base):
     )
     pagos: Mapped[list["Pago"]] = relationship(  # noqa: F821
         "Pago", back_populates="cliente", lazy="noload"
+    )
+    direcciones: Mapped[list["ClienteDireccion"]] = relationship(  # noqa: F821
+        "ClienteDireccion",
+        back_populates="cliente",
+        lazy="noload",
+        cascade="all, delete-orphan",
     )
 
     def __repr__(self) -> str:

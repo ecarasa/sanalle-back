@@ -37,6 +37,9 @@ class ClienteBase(BaseModel):
     vendedor_id: Optional[int] = None
     localidad_id: Optional[int] = None
     comentarios: Optional[str] = None
+    # Último transporte usado con este cliente. Se actualiza solo al guardar un
+    # pedido; acá se puede fijar o corregir a mano.
+    transporte_habitual: Optional[str] = None
 
 
 class ClienteCreate(ClienteBase):
@@ -61,6 +64,7 @@ class ClienteUpdate(BaseModel):
     activo: Optional[bool] = None
     localidad_id: Optional[int] = None
     comentarios: Optional[str] = None
+    transporte_habitual: Optional[str] = None
     aprobado: Optional[bool] = None
 
 
@@ -90,3 +94,37 @@ class ClienteConDeuda(ClienteResponse):
     ultima_compra: Optional[str] = None       # fecha ISO de la última compra, o None
     dias_ultima_compra: Optional[int] = None  # días desde la última compra
     semaforo_actividad: Optional[str] = None  # "verde" | "amarillo" | "rojo"
+
+
+class ClienteDireccionBase(BaseModel):
+    """Una dirección de entrega de la libreta del cliente."""
+
+    etiqueta: str
+    direccion: str
+    localidad_id: Optional[int] = None
+    codigo_postal: Optional[str] = None
+    es_default: bool = False
+
+
+class ClienteDireccionCreate(ClienteDireccionBase):
+    pass
+
+
+class ClienteDireccionUpdate(BaseModel):
+    etiqueta: Optional[str] = None
+    direccion: Optional[str] = None
+    localidad_id: Optional[int] = None
+    codigo_postal: Optional[str] = None
+    es_default: Optional[bool] = None
+    activo: Optional[bool] = None
+
+
+class ClienteDireccionResponse(ClienteDireccionBase):
+    id: int
+    cliente_id: int
+    activo: bool
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+    localidad_nombre: Optional[str] = None
+
+    model_config = {"from_attributes": True}

@@ -2,7 +2,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.pago import Pago, EstadoPago, TipoCuenta
-from app.models.pedido import Pedido, EstadoPago as EstadoPagoPedido, EstadoDespacho, TipoDocumento
+from app.models.pedido import ESTADOS_NO_COMPUTABLES, Pedido, EstadoPago as EstadoPagoPedido, TipoDocumento
 from app.models.pago_imputacion import PagoImputacion
 
 async def imputar_pagos_a_pedido(db: AsyncSession, pedido: Pedido):
@@ -10,7 +10,9 @@ async def imputar_pagos_a_pedido(db: AsyncSession, pedido: Pedido):
     Finds available payments (saldo_restante > 0) for the client and applies them
     to the specific order until it's paid or credits are exhausted.
     """
-    if pedido.saldo_pendiente <= 0 or pedido.shipping_status == EstadoDespacho.cancelado:
+    # Un borrador todavía no es una venta: imputarle el crédito del cliente lo
+    # dejaría "pagado" mientras el vendedor sigue tipeando.
+    if pedido.saldo_pendiente <= 0 or pedido.shipping_status in ESTADOS_NO_COMPUTABLES:
         return
 
     # Find available payments for this client and account type
@@ -90,7 +92,7 @@ async def imputar_pago_a_pedidos_pendientes(db: AsyncSession, pago: Pago):
         .where(
             Pedido.cliente_id == pago.cliente_id,
             Pedido.saldo_pendiente > 0,
-            Pedido.shipping_status != EstadoDespacho.cancelado
+            Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES)
         )
     )
     

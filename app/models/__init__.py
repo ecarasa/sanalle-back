@@ -1,8 +1,10 @@
 from app.models.user import User
 from app.models.cliente import Cliente
+from app.models.cliente_direccion import ClienteDireccion
 from app.models.producto import Producto
 from app.models.pedido import Pedido
 from app.models.pedido_item import PedidoItem
+from app.models.pedido_plan_pago import PedidoPlanPago
 from app.models.pago import Pago
 from app.models.tipo_iva import TipoIva
 from app.models.proveedor import Proveedor
@@ -70,4 +72,6 @@ __all__ = [
     "Configuracion",
     "Cuenta",
     "Entidad",
+    "ClienteDireccion",
+    "PedidoPlanPago",
 ]

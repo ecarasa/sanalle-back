@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract, and_, Date
 from datetime import datetime, date, timedelta
-from app.models.pedido import Pedido, EstadoDespacho
+from app.models.pedido import ESTADOS_NO_COMPUTABLES, Pedido, EstadoDespacho
 from app.models.pago import Pago, EstadoPago
 from app.models.producto import Producto
 from app.models.deposito import Deposito
@@ -72,7 +72,7 @@ async def _get_ventas_mensuales_grouped(db: AsyncSession, six_months_ago: date, 
         .where(
             and_(
                 Pedido.fecha >= six_months_ago,
-                Pedido.shipping_status != EstadoDespacho.cancelado,
+                Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
             )
         )
         .group_by('y', 'm')
@@ -114,7 +114,7 @@ async def get_ventas_dashboard(db: AsyncSession, user_id: int, desde: str | None
             func.count(Pedido.id),
         ).where(and_(
             Pedido.vendedor_id == user_id,
-            Pedido.shipping_status != EstadoDespacho.cancelado,
+            Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
             *rango_filters,
         ))
     )
@@ -129,7 +129,7 @@ async def get_ventas_dashboard(db: AsyncSession, user_id: int, desde: str | None
         .where(and_(
             Pedido.vendedor_id == user_id,
             Pedido.fecha >= month_start,
-            Pedido.shipping_status != EstadoDespacho.cancelado,
+            Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
         ))
     )
     total_vendido = float(result.scalar() or 0)
@@ -165,7 +165,7 @@ async def get_ventas_dashboard(db: AsyncSession, user_id: int, desde: str | None
         .join(Pedido, Pedido.cliente_id == Cliente.id)
         .where(and_(
             Pedido.vendedor_id == user_id,
-            Pedido.shipping_status != EstadoDespacho.cancelado,
+            Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
         ))
         .group_by(Cliente.nombre)
         .order_by(func.sum(Pedido.importe_total).desc())
@@ -252,7 +252,7 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
             func.coalesce(func.sum(Pedido.importe_total - Pedido.saldo_pendiente), 0),
             func.count(Pedido.id),
         ).where(and_(
-            Pedido.shipping_status != EstadoDespacho.cancelado,
+            Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
             *rango_filters,
         ))
     )
@@ -297,7 +297,7 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
         .where(and_(
             Pedido.fecha >= month_start,
             Pedido.fecha < next_month,
-            Pedido.shipping_status != EstadoDespacho.cancelado,
+            Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
         ))
     )
     ventas_totales = float(result.scalar() or 0)
@@ -332,7 +332,7 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
         .where(and_(
             Pedido.fecha >= three_months_ago,
             Pedido.fecha < next_month,
-            Pedido.shipping_status != EstadoDespacho.cancelado,
+            Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
         ))
         .group_by(User.nombre_completo)
         .order_by(func.sum(Pedido.importe_total).desc())
@@ -373,7 +373,7 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
         .where(and_(
             Pedido.fecha >= month_start,
             Pedido.fecha < next_month,
-            Pedido.shipping_status != EstadoDespacho.cancelado,
+            Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
         ))
         .group_by(User.nombre_completo)
         .order_by(func.sum(Pedido.importe_total).desc())

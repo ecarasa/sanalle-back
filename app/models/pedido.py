@@ -22,6 +22,11 @@ from app.core.database import Base
 
 
 class EstadoDespacho(enum.Enum):
+    # El pedido que el vendedor todavía está cargando. Reserva stock igual que
+    # `pendiente` (para avisar en el momento si no alcanza), pero no es una venta:
+    # no suma deuda, ni facturación, ni dashboard. Depósito no lo ve hasta que
+    # ventas lo finaliza.
+    borrador = "borrador"
     pendiente = "pendiente"
     en_preparacion = "en_preparacion"
     listo_para_despacho = "listo_para_despacho"
@@ -40,6 +45,11 @@ class TipoDocumento(enum.Enum):
     factura = "factura"
 
 
+# Estados que no representan una venta cerrable: se excluyen de la deuda del
+# cliente, de la cuenta corriente, del dashboard y de la imputación de pagos.
+ESTADOS_NO_COMPUTABLES = (EstadoDespacho.borrador, EstadoDespacho.cancelado)
+
+
 class Pedido(Base):
     __tablename__ = "pedidos"
 
@@ -53,8 +63,8 @@ class Pedido(Base):
     )
     shipping_status: Mapped[EstadoDespacho] = mapped_column(
         Enum(EstadoDespacho, name="estadodespacho", native_enum=True),
-        default=EstadoDespacho.pendiente,
-        server_default="pendiente",
+        default=EstadoDespacho.borrador,
+        server_default="borrador",
         nullable=False,
         index=True,
     )
@@ -92,12 +102,26 @@ class Pedido(Base):
         Integer, ForeignKey("users.id"), nullable=True, index=True
     )
 
-    # Geolocation snapshot
+    # Geolocation snapshot. `direccion_entrega` es texto a propósito: es la foto
+    # de la dirección al momento del pedido, y de ahí salen el remito y la hoja
+    # de ruta. `direccion_entrega_id` apunta a la fila de la libreta del cliente
+    # de la que se copió, para poder mostrar cuál se eligió.
+    direccion_entrega_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("cliente_direcciones.id", ondelete="SET NULL"), nullable=True
+    )
     direccion_entrega: Mapped[str | None] = mapped_column(String(500), nullable=True)
     latitud: Mapped[float | None] = mapped_column(Float, nullable=True)
     longitud: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     bultos: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0, server_default="0")
+
+    # Pedido que se carga sin comprometer mercadería: se usa en operaciones de
+    # volumen que se facturan antes de que entre el ingreso. Con esto en False no
+    # se reserva nada al crear ni se consume/devuelve al entregar o cancelar.
+    # Cuando la mercadería entra, se vuelve a poner en True y ahí sí se reserva.
+    reserva_stock: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )
 
 
     created_at: Mapped[datetime] = mapped_column(
@@ -122,6 +146,17 @@ class Pedido(Base):
         back_populates="pedido",
         lazy="noload",
         cascade="all, delete-orphan",
+    )
+    # Sin `delete-orphan` a propósito: con `lazy="noload"` la colección se ve
+    # vacía aunque en la base haya filas, y el cascade de huérfanos las borraría
+    # en cualquier flush que no la haya cargado antes. El borrado del pedido lo
+    # cubre el ON DELETE CASCADE de la FK; el reemplazo del plan se hace con un
+    # DELETE explícito en el router.
+    plan_pago: Mapped[list["PedidoPlanPago"]] = relationship(  # noqa: F821
+        "PedidoPlanPago",
+        back_populates="pedido",
+        lazy="noload",
+        passive_deletes=True,
     )
 
     def __repr__(self) -> str:

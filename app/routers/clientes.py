@@ -8,14 +8,23 @@ from pydantic import BaseModel
 from app.core.database import get_db
 from app.core.security import get_password_hash
 from app.models.cliente import Cliente
-from app.models.pedido import Pedido, EstadoDespacho
+from app.models.cliente_direccion import ClienteDireccion
+from app.models.pedido import ESTADOS_NO_COMPUTABLES, Pedido, EstadoDespacho
 from app.models.pago import Pago, EstadoPago
 from app.models.nota_credito_debito import NotaCreditoDebito
 from app.models.solicitud_cambio_cliente import SolicitudCambioCliente
 from app.models.user import User, RolUsuario
 from app.models.localidad import Localidad
 from app.models.zona import Zona
-from app.schemas.cliente import ClienteCreate, ClienteUpdate, ClienteResponse, ClienteConDeuda
+from app.schemas.cliente import (
+    ClienteConDeuda,
+    ClienteCreate,
+    ClienteDireccionCreate,
+    ClienteDireccionResponse,
+    ClienteDireccionUpdate,
+    ClienteResponse,
+    ClienteUpdate,
+)
 from app.utils.deps import get_current_user, require_role
 from app.utils.filters import apply_column_filters
 from app.services.semaforo_service import (
@@ -35,7 +44,7 @@ def _pedidos_subquery(cliente_id_col, tipo_doc=None):
     """Subquery: sum of importe_total for pedidos with active states."""
     filters = [
         Pedido.cliente_id == cliente_id_col,
-        Pedido.shipping_status != EstadoDespacho.cancelado,
+        Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
     ]
     if tipo_doc:
         filters.append(Pedido.tipo_documento == tipo_doc)
@@ -169,7 +178,7 @@ async def list_clientes(
             and_(
                 Pedido.cliente_id == Cliente.id,
                 Pedido.saldo_pendiente > 0,
-                Pedido.shipping_status != EstadoDespacho.cancelado,
+                Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
             )
         )
         .correlate(Cliente)
@@ -183,7 +192,7 @@ async def list_clientes(
         .where(
             and_(
                 Pedido.cliente_id == Cliente.id,
-                Pedido.shipping_status != EstadoDespacho.cancelado,
+                Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
             )
         )
         .correlate(Cliente)
@@ -373,18 +382,173 @@ async def get_cliente(
     return resp
 
 
+async def _geocodificar(
+    db: AsyncSession, direccion: str | None, localidad_id: int | None
+) -> tuple[float | None, float | None]:
+    """Coordenadas de una dirección. Sin localidad no se intenta: el geocoder
+    devuelve cualquier cosa de otra provincia."""
+    if not direccion or not localidad_id:
+        return None, None
+    localidad = (
+        await db.execute(select(Localidad).where(Localidad.id == localidad_id))
+    ).scalar_one_or_none()
+    if localidad is None:
+        return None, None
+    return await obtener_coordenadas_osm(direccion, localidad.nombre)
+
+
 async def _update_cliente_coords(cliente: Cliente, db: AsyncSession):
     """Helper to update lat/lon using the geolocating service."""
-    if cliente.domicilio and cliente.localidad_id:
-        # Fetch localidad name
-        result = await db.execute(select(Localidad).where(Localidad.id == cliente.localidad_id))
-        localidad = result.scalar_one_or_none()
-        if localidad:
-            lat, lon = await obtener_coordenadas_osm(cliente.domicilio, localidad.nombre)
-            if lat is not None and lon is not None:
-                print(f"Coordenadas obtenidas: {lat}, {lon}")
-                cliente.latitud = lat
-                cliente.longitud = lon
+    lat, lon = await _geocodificar(db, cliente.domicilio, cliente.localidad_id)
+    if lat is not None and lon is not None:
+        cliente.latitud = lat
+        cliente.longitud = lon
+
+
+# --- Libreta de direcciones de entrega -------------------------------------
+#
+# Van antes del `POST ""` porque FastAPI resuelve por orden y `/{id}` ya existe;
+# rutas más específicas primero.
+
+ROLES_DIRECCIONES = ["ventas", "admin", "super_admin"]
+
+
+def _direccion_response(d: ClienteDireccion) -> ClienteDireccionResponse:
+    resp = ClienteDireccionResponse.model_validate(d)
+    resp.localidad_nombre = d.localidad.nombre if d.localidad else None
+    return resp
+
+
+async def _cliente_o_404(db: AsyncSession, cliente_id: int) -> Cliente:
+    cliente = (
+        await db.execute(select(Cliente).where(Cliente.id == cliente_id))
+    ).scalar_one_or_none()
+    if cliente is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
+    return cliente
+
+
+async def _desmarcar_otros_defaults(db: AsyncSession, cliente_id: int, excepto_id: int | None) -> None:
+    """Solo una dirección puede ser la propuesta por defecto."""
+    q = sa_update(ClienteDireccion).where(ClienteDireccion.cliente_id == cliente_id)
+    if excepto_id is not None:
+        q = q.where(ClienteDireccion.id != excepto_id)
+    await db.execute(q.values(es_default=False))
+
+
+@router.get("/{cliente_id}/direcciones", response_model=list[ClienteDireccionResponse])
+async def list_direcciones(
+    cliente_id: int,
+    incluir_inactivas: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    await _cliente_o_404(db, cliente_id)
+    q = select(ClienteDireccion).where(ClienteDireccion.cliente_id == cliente_id)
+    if not incluir_inactivas:
+        q = q.where(ClienteDireccion.activo.is_(True))
+    filas = (
+        await db.execute(q.order_by(ClienteDireccion.es_default.desc(), ClienteDireccion.id))
+    ).scalars().all()
+    return [_direccion_response(d) for d in filas]
+
+
+@router.post(
+    "/{cliente_id}/direcciones",
+    response_model=ClienteDireccionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_direccion(
+    cliente_id: int,
+    body: ClienteDireccionCreate,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(ROLES_DIRECCIONES)),
+):
+    """Ventas también puede dar de alta: la dirección nueva suele aparecer en el
+    momento de cargar el pedido, y frenar eso hasta que un admin la cargue sería
+    peor que el problema."""
+    await _cliente_o_404(db, cliente_id)
+
+    lat, lon = await _geocodificar(db, body.direccion, body.localidad_id)
+    direccion = ClienteDireccion(
+        cliente_id=cliente_id,
+        latitud=lat,
+        longitud=lon,
+        **body.model_dump(),
+    )
+    db.add(direccion)
+    await db.flush()
+    if direccion.es_default:
+        await _desmarcar_otros_defaults(db, cliente_id, direccion.id)
+    await db.commit()
+
+    direccion = (
+        await db.execute(select(ClienteDireccion).where(ClienteDireccion.id == direccion.id))
+    ).scalar_one()
+    return _direccion_response(direccion)
+
+
+@router.put("/{cliente_id}/direcciones/{direccion_id}", response_model=ClienteDireccionResponse)
+async def update_direccion(
+    cliente_id: int,
+    direccion_id: int,
+    body: ClienteDireccionUpdate,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(ROLES_DIRECCIONES)),
+):
+    direccion = (
+        await db.execute(
+            select(ClienteDireccion).where(
+                ClienteDireccion.id == direccion_id,
+                ClienteDireccion.cliente_id == cliente_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if direccion is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dirección no encontrada")
+
+    cambios = body.model_dump(exclude_unset=True)
+    for campo, valor in cambios.items():
+        setattr(direccion, campo, valor)
+
+    # Si cambió la dirección o la localidad hay que volver a geocodificar: las
+    # coordenadas viejas apuntarían a la ubicación anterior en el mapa de reparto.
+    if "direccion" in cambios or "localidad_id" in cambios:
+        lat, lon = await _geocodificar(db, direccion.direccion, direccion.localidad_id)
+        direccion.latitud, direccion.longitud = lat, lon
+
+    if direccion.es_default:
+        await _desmarcar_otros_defaults(db, cliente_id, direccion.id)
+
+    await db.commit()
+    direccion = (
+        await db.execute(select(ClienteDireccion).where(ClienteDireccion.id == direccion_id))
+    ).scalar_one()
+    return _direccion_response(direccion)
+
+
+@router.delete("/{cliente_id}/direcciones/{direccion_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_direccion(
+    cliente_id: int,
+    direccion_id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(ROLES_DIRECCIONES)),
+):
+    """Baja lógica. Los pedidos que salieron a esa dirección la referencian, y
+    además guardan el texto: borrar la fila les rompería el vínculo sin ganar nada."""
+    direccion = (
+        await db.execute(
+            select(ClienteDireccion).where(
+                ClienteDireccion.id == direccion_id,
+                ClienteDireccion.cliente_id == cliente_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if direccion is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dirección no encontrada")
+    direccion.activo = False
+    direccion.es_default = False
+    await db.commit()
 
 
 @router.post("", response_model=ClienteResponse, status_code=status.HTTP_201_CREATED)
@@ -574,8 +738,8 @@ async def get_cliente_deuda(
         return float(res.scalar_one() or 0)
 
     # Pedidos
-    p_rem = await get_sum(select(func.coalesce(func.sum(Pedido.importe_total), 0)).where(and_(Pedido.cliente_id == id, Pedido.tipo_documento == "remito", Pedido.shipping_status != EstadoDespacho.cancelado)))
-    p_fac = await get_sum(select(func.coalesce(func.sum(Pedido.importe_total), 0)).where(and_(Pedido.cliente_id == id, Pedido.tipo_documento == "factura", Pedido.shipping_status != EstadoDespacho.cancelado)))
+    p_rem = await get_sum(select(func.coalesce(func.sum(Pedido.importe_total), 0)).where(and_(Pedido.cliente_id == id, Pedido.tipo_documento == "remito", Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES))))
+    p_fac = await get_sum(select(func.coalesce(func.sum(Pedido.importe_total), 0)).where(and_(Pedido.cliente_id == id, Pedido.tipo_documento == "factura", Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES))))
 
     # Pagos
     pag_rem = await get_sum(select(func.coalesce(func.sum(Pago.importe), 0)).where(and_(Pago.cliente_id == id, Pago.tipo_cuenta == "remito", Pago.estado.in_([EstadoPago.pendiente, EstadoPago.acreditado, EstadoPago.recibido, EstadoPago.imputado]))))

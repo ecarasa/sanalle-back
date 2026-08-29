@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.cliente import Cliente
-from app.models.pedido import Pedido, EstadoDespacho
+from app.models.pedido import ESTADOS_NO_COMPUTABLES, Pedido, EstadoDespacho
 from app.models.pago import Pago, EstadoPago
 from app.models.nota_credito_debito import NotaCreditoDebito, TipoNota
 from app.models.user import User
@@ -67,7 +67,7 @@ async def get_cuenta_corriente(
     # Pedidos (DEBE) - todos excepto cancelados
     pedido_filters = [
         Pedido.cliente_id == cliente_id,
-        Pedido.shipping_status != EstadoDespacho.cancelado,
+        Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
     ]
     if tipo_cuenta:
         pedido_filters.append(Pedido.tipo_documento == tipo_cuenta)
@@ -185,7 +185,7 @@ async def get_saldo(
     # Sum pedidos — todos excepto cancelados
     pedido_filters = [
         Pedido.cliente_id == cliente_id,
-        Pedido.shipping_status != EstadoDespacho.cancelado,
+        Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES),
     ]
     if fecha:
         pedido_filters.append(Pedido.fecha <= fecha)

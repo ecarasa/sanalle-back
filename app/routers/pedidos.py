@@ -17,8 +17,16 @@ from sqlalchemy.orm import selectinload, aliased
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.cliente import Cliente
-from app.models.pedido import Pedido, EstadoDespacho, EstadoPago as EstadoPagoPedido, TipoDocumento
+from app.models.cliente_direccion import ClienteDireccion
+from app.models.pedido import (
+    ESTADOS_NO_COMPUTABLES,
+    EstadoDespacho,
+    EstadoPago as EstadoPagoPedido,
+    Pedido,
+    TipoDocumento,
+)
 from app.models.pedido_item import PedidoItem
+from app.models.pedido_plan_pago import PedidoPlanPago
 from app.models.producto import Producto
 from app.models.pago_imputacion import PagoImputacion
 from app.models.user import User
@@ -26,10 +34,12 @@ from app.models.rutas import Ruta
 from app.schemas.pedido import (
     PedidoCreate,
     PedidoUpdate,
+    PedidoLogisticaUpdate,
     PedidoShippingStatusUpdate,
     PedidoPaymentStatusUpdate,
     PedidoItemComisionUpdate,
     PedidoItemResponse,
+    PedidoPlanPagoResponse,
     PedidoResponse,
     AsignarRepartidorRequest,
     OptimizarRutaRequest,
@@ -62,6 +72,11 @@ router = APIRouter()
 
 # Valid state transitions
 SHIPPING_TRANSITIONS: dict[str, list[str]] = {
+    # `borrador` es el pedido que ventas está cargando. "Finalizar" lo pasa a
+    # `pendiente`, y recién ahí aparece para depósito. No se vuelve a borrador:
+    # el camino para corregir un pedido ya tomado es que depósito lo devuelva
+    # a `pendiente`.
+    "borrador":            ["pendiente", "cancelado"],
     "pendiente":           ["en_preparacion", "cancelado"],
     "en_preparacion":      ["listo_para_despacho", "pendiente", "cancelado"],
     "listo_para_despacho": ["en_camino", "en_preparacion", "cancelado"],
@@ -103,10 +118,15 @@ ROLE_SHIPPING_ALLOWED: dict[str, set[tuple[str, str]]] = {
     },
 }
 
-# Un pedido solo se puede editar en `pendiente`, así que devolverlo a ese estado
-# es lo que lo desbloquea: no lo hace cualquiera. Es tarea de depósito, y admin
+# Un pedido que ya salió de manos de ventas solo se vuelve a editar si depósito
+# lo devuelve a `pendiente`: no lo hace cualquiera. Es tarea de depósito, y admin
 # queda de respaldo para que un pedido no se trabe si no hay nadie en depósito.
 ROLES_PUEDEN_REABRIR = ("operaciones", "admin", "super_admin")
+
+# Estados en los que el pedido todavía es de ventas y se puede modificar.
+# `operaciones` y `repartidor` no pueden finalizar un borrador: la transición
+# `borrador -> pendiente` no figura en su juego de ROLE_SHIPPING_ALLOWED.
+ESTADOS_EDITABLES = (EstadoDespacho.borrador, EstadoDespacho.pendiente)
 
 
 @router.get("/preparacion")
@@ -141,6 +161,10 @@ async def list_preparacion(
             "cliente": p.cliente.nombre if p.cliente else "-",
             "fecha": p.fecha.isoformat() if p.fecha else None,
             "fecha_entrega": p.fecha_entrega.isoformat() if p.fecha_entrega else None,
+            "bultos": p.bultos or 0,
+            # Depósito tiene que saber que esa mercadería puede no estar todavía
+            # en la góndola: el pedido se cargó sin comprometer stock.
+            "reserva_stock": p.reserva_stock,
             "observacion": p.observacion,
             "items": [
                 {
@@ -214,7 +238,13 @@ async def _mover_reservas_pedido(db: AsyncSession, pedido: Pedido, *, devolver: 
 
     Las líneas sin depósito son pedidos viejos anteriores a esta función; se saltean
     en vez de adivinar un depósito y descuadrar el stock de uno que no corresponde.
+
+    Un pedido con `reserva_stock` apagado nunca reservó nada, así que no hay qué
+    consumir ni qué devolver: tocarlo inventaría mercadería.
     """
+    if not pedido.reserva_stock:
+        return
+
     for item in pedido.items:
         if not item.deposito_id:
             continue
@@ -226,6 +256,76 @@ async def _mover_reservas_pedido(db: AsyncSession, pedido: Pedido, *, devolver: 
         if producto is None:
             continue
         mover = stock_service.liberar_reserva if devolver else stock_service.consumir_reserva
+        await mover(db, producto, item.deposito_id, item.cantidad_cajas, item.cantidad_blisters)
+
+
+async def _resolver_envio(
+    db: AsyncSession, cliente: Cliente, direccion_entrega_id: int | None, texto: str | None
+) -> tuple[int | None, str, float | None, float | None]:
+    """Devuelve (direccion_id, texto, lat, lon) para el envío del pedido.
+
+    Prioridad: la dirección elegida de la libreta del cliente; si no, el texto
+    que se escribió a mano; si no, el domicilio del cliente. El texto siempre se
+    guarda en el pedido, porque de ahí salen el remito y la hoja de ruta y no
+    tienen que cambiar si mañana se corrige la libreta.
+    """
+    if direccion_entrega_id is not None:
+        direccion = (
+            await db.execute(
+                select(ClienteDireccion).where(
+                    ClienteDireccion.id == direccion_entrega_id,
+                    ClienteDireccion.cliente_id == cliente.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if direccion is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="La dirección de entrega elegida no es de este cliente.",
+            )
+        return (
+            direccion.id,
+            direccion.direccion,
+            direccion.latitud if direccion.latitud is not None else cliente.latitud,
+            direccion.longitud if direccion.longitud is not None else cliente.longitud,
+        )
+
+    return None, (texto or "").strip() or cliente.domicilio, cliente.latitud, cliente.longitud
+
+
+async def _recordar_transporte(db: AsyncSession, cliente_id: int, transporte: str | None) -> None:
+    """Guarda en el cliente el último transporte usado.
+
+    Es lo que evita retipearlo en cada pedido. Se hace al guardar el pedido y no
+    al elegirlo, para que un transporte tipeado a medias no quede pegado.
+    """
+    valor = (transporte or "").strip()
+    if not valor:
+        return
+    cliente = await db.get(Cliente, cliente_id)
+    if cliente is not None and cliente.transporte_habitual != valor:
+        cliente.transporte_habitual = valor
+
+
+async def _aplicar_cambio_reserva(db: AsyncSession, pedido: Pedido, *, activar: bool) -> None:
+    """Prende o apaga la reserva de todas las líneas de un pedido ya cargado.
+
+    Es lo que pasa cuando se toca el tilde "no descuenta stock" sin tocar los
+    ítems: activarlo compromete la mercadería ahora (y falla con 400 si no
+    alcanza, sin dejar nada a medias porque la transacción se revierte entera);
+    apagarlo la devuelve al stock vendible.
+    """
+    mover = stock_service.reservar if activar else stock_service.liberar_reserva
+    for item in pedido.items:
+        if not item.deposito_id:
+            continue
+        producto = (
+            await db.execute(
+                select(Producto).where(Producto.id == item.producto_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if producto is None:
+            continue
         await mover(db, producto, item.deposito_id, item.cantidad_cajas, item.cantidad_blisters)
 
 
@@ -283,6 +383,32 @@ def _build_item_response(item: PedidoItem) -> PedidoItemResponse:
     )
 
 
+def _plan_pago_response(fila: PedidoPlanPago) -> PedidoPlanPagoResponse:
+    resp = PedidoPlanPagoResponse.model_validate(fila)
+    resp.cuenta_nombre = fila.cuenta.nombre if fila.cuenta else None
+    return resp
+
+
+async def _reemplazar_plan_pago(db: AsyncSession, pedido: Pedido, tramos) -> None:
+    """Reescribe el plan de cobro del pedido.
+
+    Se reemplaza entero, igual que los ítems: son pocas filas y llevar un diff
+    fila por fila no aporta nada. No mueve plata: es solo la instrucción de cómo
+    se va a cobrar.
+    """
+    await db.execute(delete(PedidoPlanPago).where(PedidoPlanPago.pedido_id == pedido.id))
+    for tramo in tramos:
+        db.add(
+            PedidoPlanPago(
+                pedido_id=pedido.id,
+                forma=tramo.forma,
+                cuenta_id=tramo.cuenta_id,
+                importe=Decimal(str(tramo.importe or 0)),
+                observacion=tramo.observacion,
+            )
+        )
+
+
 def _depositos_de(pedido: Pedido) -> list[str]:
     """Nombres de los depósitos de los que sale el pedido, sin repetir y en orden."""
     nombres: list[str] = []
@@ -336,10 +462,13 @@ def _build_pedido_response(pedido: Pedido) -> PedidoResponse:
         cliente_zona=pedido.cliente.zona_rel.nombre if pedido.cliente and pedido.cliente.zona_rel else None,
         repartidor_id=pedido.repartidor_id,
         repartidor_nombre=pedido.repartidor.nombre_completo if pedido.repartidor else None,
+        direccion_entrega_id=pedido.direccion_entrega_id,
         direccion_entrega=pedido.direccion_entrega or (pedido.cliente.domicilio if pedido.cliente else None),
         latitud=pedido.latitud if pedido.latitud is not None else (pedido.cliente.latitud if pedido.cliente else None),
         longitud=pedido.longitud if pedido.longitud is not None else (pedido.cliente.longitud if pedido.cliente else None),
         bultos=pedido.bultos,
+        reserva_stock=pedido.reserva_stock,
+        plan_pago=[_plan_pago_response(t) for t in pedido.plan_pago],
         items=items,
 
         created_at=pedido.created_at,
@@ -354,6 +483,7 @@ def _load_options():
         selectinload(Pedido.vendedor),
         selectinload(Pedido.repartidor),
         selectinload(Pedido.items).selectinload(PedidoItem.producto),
+        selectinload(Pedido.plan_pago),
     ]
 
 
@@ -533,7 +663,7 @@ async def get_pedido_calendario(
         select(Pedido)
         .options(*_load_options())
         .where(Pedido.fecha_entrega.isnot(None))
-        .where(Pedido.shipping_status != EstadoDespacho.cancelado)
+        .where(Pedido.shipping_status.notin_(ESTADOS_NO_COMPUTABLES))
     )
 
     filters = []
@@ -990,23 +1120,29 @@ async def create_pedido(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Vendedor no encontrado",
         )
+    direccion_id, direccion_texto, envio_lat, envio_lon = await _resolver_envio(
+        db, cliente, body.direccion_entrega_id, body.direccion_entrega
+    )
+
     pedido = Pedido(
         numero_pedido=numero_pedido,
         cliente_id=body.cliente_id,
         vendedor_id=vendedor_id,
         tipo_documento=tipo_doc,
         fecha=date.today(),
-        fecha_entrega=body.fecha_entrega,
-        transporte=body.transporte,
+        # Sugerida a partir de los días de entrega del cliente. Ventas ya no la
+        # carga: depósito la confirma o la corrige desde Preparación.
+        fecha_entrega=date.today() + timedelta(days=cliente.dias_entrega or 1),
+        # Si no se eligió transporte, se propone el último que usó el cliente.
+        transporte=body.transporte or cliente.transporte_habitual,
         fecha_compromiso_pago=body.fecha_compromiso_pago,
-        despachado=body.despachado,
         sociedad=body.sociedad,
         observacion=body.observacion,
-        # Envío: usa la dirección editada; si no vino, el domicilio del cliente.
-        direccion_entrega=(body.direccion_entrega or "").strip() or cliente.domicilio,
-        latitud=cliente.latitud,
-        longitud=cliente.longitud,
-        bultos=body.bultos,
+        direccion_entrega_id=direccion_id,
+        direccion_entrega=direccion_texto,
+        latitud=envio_lat,
+        longitud=envio_lon,
+        reserva_stock=body.reserva_stock,
         tipo_precio=body.tipo_precio,
         importe_total=Decimal("0"),
         saldo_pendiente=Decimal("0"),
@@ -1054,8 +1190,11 @@ async def create_pedido(
         # La sociedad ya no interviene, es solo un dato de facturación.
         deposito_id = await _resolver_deposito(db, item_data, body.deposito_id)
         # reservar valida y mueve físico -> reservado en un solo paso; si no alcanza
-        # tira 400 sin haber tocado nada y el pedido entero se rechaza.
-        await stock_service.reservar(db, producto, deposito_id, cajas, blisters)
+        # tira 400 sin haber tocado nada y el pedido entero se rechaza. Un pedido
+        # marcado para no mover stock se salta este paso: la mercadería todavía no
+        # entró y comprometerla daría negativo.
+        if pedido.reserva_stock:
+            await stock_service.reservar(db, producto, deposito_id, cajas, blisters)
 
         comision = _comision_para(vendedor, producto)
 
@@ -1092,8 +1231,13 @@ async def create_pedido(
     pedido.importe_total = importe_total
     pedido.saldo_pendiente = importe_total
 
+    if body.plan_pago:
+        await _reemplazar_plan_pago(db, pedido, body.plan_pago)
+
     # Auto-imputar pagos disponibles (créditos a favor del cliente)
     await imputar_pagos_a_pedido(db, pedido)
+
+    await _recordar_transporte(db, pedido.cliente_id, pedido.transporte)
 
     await db.commit()
 
@@ -1130,12 +1274,13 @@ async def update_pedido(
     if body.vendedor_id is not None and not is_admin and body.vendedor_id != pedido.vendedor_id:
         raise HTTPException(status_code=403, detail="Solo admin puede cambiar el vendedor")
 
-    # Un pedido se edita solo mientras está en `pendiente`. Una vez que pasó a
-    # preparación, depósito ya está armando físicamente esa mercadería: si el
-    # pedido pudiera cambiar por debajo, lo que se arma y lo que se factura
-    # dejarían de coincidir. La regla no tiene excepción por rol a propósito;
-    # el camino para corregir es devolverlo a pendiente.
-    if pedido.shipping_status != EstadoDespacho.pendiente:
+    # Un pedido se edita mientras es de ventas: `borrador` (se está cargando) o
+    # `pendiente` (finalizado, todavía sin tomar). Una vez que pasó a preparación,
+    # depósito ya está armando físicamente esa mercadería: si el pedido pudiera
+    # cambiar por debajo, lo que se arma y lo que se factura dejarían de coincidir.
+    # La regla no tiene excepción por rol a propósito; el camino para corregir es
+    # devolverlo a pendiente.
+    if pedido.shipping_status not in ESTADOS_EDITABLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -1174,8 +1319,29 @@ async def update_pedido(
         except ValueError:
             raise HTTPException(status_code=400, detail="Tipo documento inválido")
 
+    # El tilde de "no descuenta stock" hay que leerlo ANTES del setattr: las
+    # reservas que existen hoy se hicieron con el valor viejo, y las que se van a
+    # crear responden al nuevo. Mezclarlos inventa o pierde mercadería.
+    reserva_previa = pedido.reserva_stock
+
+    # La dirección de entrega se resuelve aparte: elegir una de la libreta tiene
+    # que arrastrar el texto y las coordenadas, no solo el id.
+    envio_tocado = "direccion_entrega_id" in update_data or "direccion_entrega" in update_data
+    update_data.pop("direccion_entrega_id", None)
+    update_data.pop("direccion_entrega", None)
+
     for field, value in update_data.items():
         setattr(pedido, field, value)
+
+    if envio_tocado:
+        cliente = await db.get(Cliente, pedido.cliente_id)
+        direccion_id, direccion_texto, envio_lat, envio_lon = await _resolver_envio(
+            db, cliente, body.direccion_entrega_id, body.direccion_entrega
+        )
+        pedido.direccion_entrega_id = direccion_id
+        pedido.direccion_entrega = direccion_texto
+        pedido.latitud = envio_lat
+        pedido.longitud = envio_lon
 
     # Replace items if provided
     if body.items is not None:
@@ -1185,7 +1351,7 @@ async def update_pedido(
                 select(Producto).where(Producto.id == existing_item.producto_id).with_for_update()
             )
             producto = prod_result.scalar_one_or_none()
-            if producto and existing_item.deposito_id:
+            if producto and existing_item.deposito_id and reserva_previa:
                 # Se devuelve al mismo depósito del que salió, no al que tenga
                 # seleccionado el pedido ahora: la mercadería está donde estaba.
                 await stock_service.liberar_reserva(
@@ -1217,7 +1383,8 @@ async def update_pedido(
             # Resolver cantidades según el formato de venta de la línea (caja/blister)
             cajas, blisters, unidad_venta = _resolver_cantidades(item_data, producto)
             deposito_id = await _resolver_deposito(db, item_data, body.deposito_id)
-            await stock_service.reservar(db, producto, deposito_id, cajas, blisters)
+            if pedido.reserva_stock:
+                await stock_service.reservar(db, producto, deposito_id, cajas, blisters)
 
             comision = _comision_para(vendedor, producto)
 
@@ -1247,8 +1414,18 @@ async def update_pedido(
         # Auto-imputar pagos disponibles si hay saldo pendiente tras la actualización
         await imputar_pagos_a_pedido(db, pedido)
 
+    elif pedido.reserva_stock != reserva_previa:
+        # Cambió solo el tilde: las líneas siguen siendo las mismas, hay que
+        # comprometerlas o devolverlas todas.
+        await _aplicar_cambio_reserva(db, pedido, activar=pedido.reserva_stock)
+
     # Bitácora: se compara contra las fotos tomadas al principio. Hace falta el flush
     # para que los items recién creados existan en la sesión antes de releerlos.
+    if body.plan_pago is not None:
+        await _reemplazar_plan_pago(db, pedido, body.plan_pago)
+
+    await _recordar_transporte(db, pedido.cliente_id, pedido.transporte)
+
     await db.flush()
     await registrar_cambios_pedido(
         db,
@@ -1274,7 +1451,15 @@ async def update_pedido(
 
     await db.commit()
 
-    reload_query = select(Pedido).where(Pedido.id == pedido.id).options(*_load_options())
+    # `populate_existing`: el pedido ya está en la sesión con sus colecciones sin
+    # cargar (lazy='noload'), y sin esto el selectinload no las pisa — la respuesta
+    # saldría con items y plan de pago vacíos aunque en la base estén.
+    reload_query = (
+        select(Pedido)
+        .where(Pedido.id == pedido.id)
+        .options(*_load_options())
+        .execution_options(populate_existing=True)
+    )
     result = await db.execute(reload_query)
     pedido = result.scalar_one()
 
@@ -1325,7 +1510,15 @@ async def update_shipping_status(
     # Devolver a `pendiente` es lo que habilita a editar el pedido, así que está
     # restringido aunque la transición sea válida: ventas no puede reabrir sus
     # propios pedidos una vez que depósito los tomó.
-    if nuevo_shipping == EstadoDespacho.pendiente and current_user.rol.value not in ROLES_PUEDEN_REABRIR:
+    #
+    # Venir de `borrador` no es reabrir, es finalizar: ese paso lo da ventas y no
+    # tiene nada que ver con esta restricción. Que depósito no pueda finalizar un
+    # borrador ya lo cubre ROLE_SHIPPING_ALLOWED.
+    reabre = (
+        nuevo_shipping == EstadoDespacho.pendiente
+        and pedido.shipping_status != EstadoDespacho.borrador
+    )
+    if reabre and current_user.rol.value not in ROLES_PUEDEN_REABRIR:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Solo depósito puede devolver un pedido a 'pendiente' para que se pueda editar.",
@@ -1355,10 +1548,91 @@ async def update_shipping_status(
 
     await db.commit()
 
-    reload_query = select(Pedido).where(Pedido.id == pedido.id).options(*_load_options())
+    # `populate_existing`: el pedido ya está en la sesión con sus colecciones sin
+    # cargar (lazy='noload'), y sin esto el selectinload no las pisa — la respuesta
+    # saldría con items y plan de pago vacíos aunque en la base estén.
+    reload_query = (
+        select(Pedido)
+        .where(Pedido.id == pedido.id)
+        .options(*_load_options())
+        .execution_options(populate_existing=True)
+    )
     result = await db.execute(reload_query)
     pedido = result.scalar_one()
 
+    return _build_pedido_response(pedido)
+
+
+@router.patch("/{id}/logistica")
+async def update_logistica(
+    id: int,
+    body: PedidoLogisticaUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(
+        require_role(["operaciones", "admin", "super_admin", "repartidor"])
+    ),
+):
+    """Bultos, fecha de entrega y despachado: los datos que carga depósito.
+
+    Va por acá y no por el `PUT` general a propósito. El `PUT` está bloqueado en
+    cuanto el pedido sale de `pendiente`, y estos tres datos aparecen justo
+    después: los bultos se cuentan mientras se arma y la fecha de entrega se
+    confirma al planificar el reparto. Que sean campos aparte también evita que
+    depósito pueda tocar precios o cantidades sin querer.
+    """
+    result = await db.execute(select(Pedido).where(Pedido.id == id).with_for_update())
+    pedido = result.scalar_one_or_none()
+    if pedido is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pedido no encontrado")
+
+    if pedido.shipping_status in (EstadoDespacho.entregado, EstadoDespacho.cancelado):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"El pedido está en '{pedido.shipping_status.value}': ya no se puede modificar.",
+        )
+
+    cambios = body.model_dump(exclude_unset=True)
+
+    # El repartidor solo confirma el despacho; contar bultos y fijar la fecha de
+    # entrega es de depósito.
+    if current_user.rol.value == "repartidor":
+        no_permitidos = set(cambios) - {"despachado"}
+        if no_permitidos:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="El repartidor solo puede marcar el pedido como despachado.",
+            )
+
+    if not cambios:
+        return _build_pedido_response(
+            (await db.execute(select(Pedido).where(Pedido.id == id).options(*_load_options()))).scalar_one()
+        )
+
+    estado_previo = snapshot_pedido(pedido)
+    for campo, valor in cambios.items():
+        setattr(pedido, campo, valor)
+
+    await registrar_cambios_pedido(
+        db,
+        pedido=pedido,
+        antes=estado_previo,
+        usuario=current_user,
+        evento="logistica",
+        grupo_id=nuevo_grupo_id(),
+    )
+
+    await db.commit()
+
+    # `populate_existing`: el pedido ya está en la sesión con sus colecciones sin
+    # cargar (lazy='noload'), y sin esto el selectinload no las pisa — la respuesta
+    # saldría con items y plan de pago vacíos aunque en la base estén.
+    reload_query = (
+        select(Pedido)
+        .where(Pedido.id == pedido.id)
+        .options(*_load_options())
+        .execution_options(populate_existing=True)
+    )
+    pedido = (await db.execute(reload_query)).scalar_one()
     return _build_pedido_response(pedido)
 
 
@@ -1408,7 +1682,15 @@ async def update_payment_status(
 
     await db.commit()
 
-    reload_query = select(Pedido).where(Pedido.id == pedido.id).options(*_load_options())
+    # `populate_existing`: el pedido ya está en la sesión con sus colecciones sin
+    # cargar (lazy='noload'), y sin esto el selectinload no las pisa — la respuesta
+    # saldría con items y plan de pago vacíos aunque en la base estén.
+    reload_query = (
+        select(Pedido)
+        .where(Pedido.id == pedido.id)
+        .options(*_load_options())
+        .execution_options(populate_existing=True)
+    )
     result = await db.execute(reload_query)
     pedido = result.scalar_one()
 
@@ -1694,10 +1976,14 @@ async def delete_pedido(
             detail="Pedido no encontrado",
         )
 
-    if pedido.shipping_status not in (EstadoDespacho.pendiente, EstadoDespacho.en_preparacion):
+    if pedido.shipping_status not in (
+        EstadoDespacho.borrador,
+        EstadoDespacho.pendiente,
+        EstadoDespacho.en_preparacion,
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Solo se pueden eliminar pedidos en estado Pendiente o En Preparación",
+            detail="Solo se pueden eliminar pedidos en estado Borrador, Pendiente o En Preparación",
         )
 
     # El borrador que se creó y se canceló sin tocar nada no deja rastro. Cualquier

@@ -37,6 +37,7 @@ CAMPOS_PEDIDO_AUDITADOS: tuple[str, ...] = (
     "bultos",
     "sociedad",
     "despachado",
+    "reserva_stock",
     "importe_total",
 )
 

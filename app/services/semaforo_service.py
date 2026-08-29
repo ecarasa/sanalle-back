@@ -54,13 +54,15 @@ def calcular_semaforo_pedido(
     """Calculate pedido traffic light based on shipping_status, payment_status, and delivery date.
 
     Returns: 'rojo', 'azul', 'verde', 'amarillo', or 'gris'
-    - gris    → Cerrado (entregado o cancelado)
+    - gris    → Sin circuito activo (borrador, entregado o cancelado)
     - verde   → Listo para despacho
     - amarillo → Aguardando pago (tiene fecha de compromiso y no está despachado)
     - rojo    → Despacha hoy/mañana o cargado sin fecha
     - azul    → Despacha pasado mañana
     """
-    CERRADOS = {"entregado", "cancelado"}
+    # `borrador` entra acá porque todavía no es una venta: no tiene sentido
+    # apurar la entrega de un pedido que el vendedor está tipeando.
+    CERRADOS = {"borrador", "entregado", "cancelado"}
 
     if shipping_status in CERRADOS or payment_status == "cancelado":
         return "gris"
