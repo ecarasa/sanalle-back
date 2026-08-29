@@ -496,6 +496,11 @@ async def list_pedidos(
     search: str = Query("", description="Buscar por numero_pedido o nombre de cliente"),
     cliente_id: int | None = Query(None),
     shipping_status: str | None = Query(None, description="Filtrar por estado de despacho"),
+    estados: str | None = Query(
+        None,
+        description="Varios estados de despacho separados por coma. Permite pedir "
+                    "'todo lo pendiente de despacho' sin atarlo a una fecha.",
+    ),
     excluir_borradores: bool = Query(
         False,
         description="Deja afuera las cotizaciones (pedidos en borrador), que tienen su propia sección",
@@ -571,6 +576,19 @@ async def list_pedidos(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"shipping_status inválido: {shipping_status}. Válidos: {[e.value for e in EstadoDespacho]}",
             )
+
+    if estados:
+        # Los valores que no son estados válidos se rechazan en vez de ignorarse:
+        # un typo dejaría el listado más ancho de lo que el que llama cree.
+        try:
+            estados_enum = [EstadoDespacho(e.strip()) for e in estados.split(",") if e.strip()]
+        except ValueError as err:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"estados inválido: {err}. Válidos: {[e.value for e in EstadoDespacho]}",
+            )
+        if estados_enum:
+            filters.append(Pedido.shipping_status.in_(estados_enum))
 
     # Las cotizaciones viven en su propia pantalla: no se mezclan con los pedidos
     # ya confirmados. El filtro explícito por estado manda sobre esto, así que
