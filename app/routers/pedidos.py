@@ -82,7 +82,11 @@ SHIPPING_TRANSITIONS: dict[str, list[str]] = {
     "listo_para_despacho": ["en_camino", "en_preparacion", "cancelado"],
     "en_camino":           ["entregado", "cancelado"],
     "entregado":           [],
-    "cancelado":           [],
+    # Cancelar no es el final del camino: se cancela por error, o el cliente
+    # rehace la compra. Vuelve a `borrador` y no a `pendiente` porque mientras
+    # estuvo cancelado pudo cambiar cualquier cosa (precios, stock, lo que el
+    # cliente quiere), y ahí es donde se corrige antes de volver a mandarlo.
+    "cancelado":           ["borrador"],
 }
 
 PAYMENT_TRANSITIONS: dict[str, list[str]] = {
@@ -492,6 +496,10 @@ async def list_pedidos(
     search: str = Query("", description="Buscar por numero_pedido o nombre de cliente"),
     cliente_id: int | None = Query(None),
     shipping_status: str | None = Query(None, description="Filtrar por estado de despacho"),
+    excluir_borradores: bool = Query(
+        False,
+        description="Deja afuera las cotizaciones (pedidos en borrador), que tienen su propia sección",
+    ),
     payment_status: str | None = Query(None, description="Filtrar por estado de pago"),
     tipo_documento: str | None = Query(None),
     fecha_desde: date | None = Query(None),
@@ -563,6 +571,12 @@ async def list_pedidos(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"shipping_status inválido: {shipping_status}. Válidos: {[e.value for e in EstadoDespacho]}",
             )
+
+    # Las cotizaciones viven en su propia pantalla: no se mezclan con los pedidos
+    # ya confirmados. El filtro explícito por estado manda sobre esto, así que
+    # pedir shipping_status=borrador sigue funcionando.
+    if excluir_borradores and shipping_status is None:
+        filters.append(Pedido.shipping_status != EstadoDespacho.borrador)
 
     if payment_status is not None:
         try:
@@ -1529,6 +1543,12 @@ async def update_shipping_status(
         await _mover_reservas_pedido(db, pedido, devolver=False)
     elif nuevo_shipping == EstadoDespacho.cancelado:
         await _mover_reservas_pedido(db, pedido, devolver=True)
+    elif pedido.shipping_status == EstadoDespacho.cancelado and pedido.reserva_stock:
+        # Reactivar: al cancelar se soltó la mercadería y pudo haberse vendido.
+        # Se vuelve a comprometer acá; si ya no alcanza, `reservar` tira 400
+        # diciendo qué producto y cuánto falta, y la transacción se revierte
+        # entera: el pedido sigue cancelado y el stock queda como estaba.
+        await _aplicar_cambio_reserva(db, pedido, activar=True)
 
     estado_anterior = pedido.shipping_status
     pedido.shipping_status = nuevo_shipping

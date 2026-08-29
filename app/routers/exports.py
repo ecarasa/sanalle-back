@@ -174,6 +174,7 @@ async def export_pedidos(
     cliente_id: int | None = Query(None, description="Filtrar por cliente"),
     shipping_status: str | None = Query(None, description="Filtrar por estado de despacho"),
     payment_status: str | None = Query(None, description="Filtrar por estado de pago"),
+    excluir_borradores: bool = Query(False, description="Deja afuera las cotizaciones"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -192,6 +193,9 @@ async def export_pedidos(
             query = query.where(Pedido.shipping_status == EstadoDespacho(shipping_status))
         except ValueError:
             pass
+    # El export tiene que sacar lo mismo que la pantalla desde la que se pide.
+    if excluir_borradores and not shipping_status:
+        query = query.where(Pedido.shipping_status != EstadoDespacho.borrador)
     if payment_status:
         try:
             query = query.where(Pedido.payment_status == EstadoPagoPedido(payment_status))
