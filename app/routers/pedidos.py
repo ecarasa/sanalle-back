@@ -1876,6 +1876,7 @@ async def get_pedido_pdf(
             selectinload(Pedido.cliente).selectinload(Cliente.localidad_rel),
             selectinload(Pedido.vendedor),
             selectinload(Pedido.items).selectinload(PedidoItem.producto),
+            selectinload(Pedido.plan_pago),
         )
     )
     result = await db.execute(query)
@@ -1895,6 +1896,16 @@ async def get_pedido_pdf(
         "importe_total": 0.0 if sin_valores else float(pedido.importe_total),
         "observacion": pedido.observacion,
         "tipo_documento": pedido.tipo_documento.value if pedido.tipo_documento else "remito",
+        # El plan de cobro es información de dinero: en la copia sin valores (la
+        # que se le da a depósito para armar) no va.
+        "plan_pago": [] if sin_valores else [
+            {
+                "forma": t.forma,
+                "cuenta_nombre": t.cuenta.nombre if t.cuenta else None,
+                "importe": float(t.importe),
+            }
+            for t in pedido.plan_pago
+        ],
     }
     cliente_data = {
         "nombre": pedido.cliente.nombre if pedido.cliente else "",

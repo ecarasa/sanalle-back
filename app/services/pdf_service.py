@@ -703,6 +703,40 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
     elements.append(Paragraph(f"Son: {numero_a_letras(importe_total)}", letras_st))
     elements.append(Spacer(1, 6 * mm))
 
+    # --- Plan de cobro (cómo se cobra y a qué cuenta entra cada parte) ---
+    # Es una indicación para cobranza, no un cobro registrado: por eso va abajo
+    # del total y no forma parte de los importes del comprobante.
+    plan_pago = pedido_data.get('plan_pago') or []
+    if plan_pago:
+        pp_title_st = ParagraphStyle('_ppt', fontName='Helvetica-Bold', fontSize=8, textColor=BLUE, leading=11)
+        pp_cell_st = ParagraphStyle('_ppc', fontName='Helvetica', fontSize=8.5, textColor=colors.black, leading=12)
+        pp_num_st = ParagraphStyle('_ppn', parent=pp_cell_st, alignment=TA_RIGHT)
+
+        filas = [[Paragraph("FORMA DE PAGO", pp_title_st),
+                  Paragraph("CUENTA", pp_title_st),
+                  Paragraph("IMPORTE", ParagraphStyle('_ppth', parent=pp_title_st, alignment=TA_RIGHT))]]
+        for tramo in plan_pago:
+            filas.append([
+                Paragraph(str(tramo.get('forma') or '-'), pp_cell_st),
+                Paragraph(str(tramo.get('cuenta_nombre') or '-'), pp_cell_st),
+                Paragraph(f"$ {float(tramo.get('importe') or 0):,.2f}", pp_num_st),
+            ])
+
+        pp_box = Table(filas, colWidths=[content_w * 0.4, content_w * 0.4, content_w * 0.2])
+        pp_box.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), LIGHT_BG),
+            ('BOX', (0, 0), (-1, -1), 0.6, CARD_BORDER),
+            ('LINEBEFORE', (0, 0), (0, -1), 3, CELESTE),
+            ('LINEBELOW', (0, 0), (-1, 0), 0.5, CARD_BORDER),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('LEFTPADDING', (0, 0), (-1, -1), 9),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+        ]))
+        elements.append(pp_box)
+        elements.append(Spacer(1, 5 * mm))
+
     # --- Observaciones (recuadro suave) ---
     obs = pedido_data.get('observacion', '')
     if obs:

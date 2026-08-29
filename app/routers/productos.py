@@ -292,9 +292,16 @@ async def list_productos_public(
 
 @router.get("/import-template")
 async def descargar_import_template(
+    db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(require_role(["admin", "super_admin"])),
 ):
-    """Download a blank XLSX template for bulk product import."""
+    """Download a blank XLSX template for bulk product import.
+
+    Las columnas de stock se arman con los depósitos que existen ahora mismo, que
+    es exactamente lo que lee el importador. Antes la plantilla traía las columnas
+    viejas ("Stock A / Stock B") y el importador ya no las reconocía: quien la
+    bajaba y cargaba stock no veía ningún error, simplemente no se importaba nada.
+    """
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -303,10 +310,19 @@ async def descargar_import_template(
     ws = wb.active
     ws.title = "Productos"
 
+    depositos_all = (
+        await db.execute(
+            select(Deposito).where(Deposito.activo.is_(True)).order_by(Deposito.orden, Deposito.id)
+        )
+    ).scalars().all()
+    stock_cols = [
+        f"Stock {dep.nombre} {unidad}" for dep in depositos_all for unidad in ("cajas", "blisters")
+    ]
+
     required_cols = ["Código", "Nombre", "Presentación", "URL PVP (Alfabeta)", "Categoría Producto"]
     optional_cols = [
-        "Laboratorio", "Proveedor", "PVP",
-        "Stock A Cajas", "Stock A Blisters", "Stock B Cajas", "Stock B Blisters",
+        "Laboratorio", "Proveedor", "PVP", "Blisters por caja",
+        *stock_cols,
         "Margen Minorista %", "Margen Mayorista %", "Margen Comercio %",
     ]
     headers = required_cols + optional_cols
@@ -330,16 +346,21 @@ async def descargar_import_template(
     # no se publica en esa lista (es opt-in por producto).
     example = [
         "ABC-001", "Ibuprofeno 400mg", "Caja x 20 comp.", "https://alfabeta.net/...", "OTC",
-        "Laboratorio Ejemplo", "Proveedor Ejemplo", 1500.0, 10, 0, 0, 0, 30.0, 20.0,
-        None,
+        "Laboratorio Ejemplo", "Proveedor Ejemplo", 1500.0, 10,
+        *([10, 0] * len(depositos_all)),
+        30.0, 20.0, None,
     ]
     for col_idx, val in enumerate(example, 1):
         cell = ws.cell(row=2, column=col_idx, value=val)
         cell.border = thin_border
 
-    col_widths = [14, 40, 20, 35, 20, 22, 22, 10, 14, 15, 14, 15, 18, 18, 26, 26, 28]
-    for col_idx, width in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    anchos = {
+        "Código": 14, "Nombre": 40, "Presentación": 20, "URL PVP (Alfabeta)": 35,
+        "Categoría Producto": 20, "Laboratorio": 22, "Proveedor": 22, "PVP": 12,
+        "Blisters por caja": 18,
+    }
+    for col_idx, name in enumerate(headers, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = anchos.get(name, 22)
 
     output = io.BytesIO()
     wb.save(output)
@@ -997,6 +1018,26 @@ async def import_productos_excel(
                     mapped[field] = Decimal(str(val)).quantize(Decimal("0.01"))
                 except (ValueError, TypeError):
                     errors.append(f"Fila {row_idx}: valor inválido para '{header}' ({val!r})")
+
+        # Blísters por caja: es lo que habilita vender fraccionado. Sin este dato
+        # el producto entra como "solo caja" y el selector de unidad ni aparece,
+        # que era justo lo que pasaba con todo lo que entraba por planilla.
+        bl_por_caja = _cell(row, "blisters por caja")
+        if bl_por_caja is not None:
+            try:
+                n = int(bl_por_caja)
+                if n < 1:
+                    raise ValueError
+                mapped["blisters_por_caja"] = n
+                # Mismo criterio que el alta manual: si fracciona, se habilita la
+                # venta por blíster. Con 1 blíster por caja el "blíster" sería la
+                # caja entera, así que ahí no se toca.
+                if n > 1:
+                    mapped["vende_blister"] = True
+            except (ValueError, TypeError):
+                errors.append(
+                    f"Fila {row_idx}: 'Blisters por caja' tiene que ser un entero >= 1 ({bl_por_caja!r})"
+                )
 
         # Stock por depósito de esta fila: {deposito_id: {"cajas": n, "blisters": n}}
         stock_fila: dict[int, dict[str, int]] = {}
