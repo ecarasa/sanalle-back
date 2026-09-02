@@ -5,7 +5,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_
+from sqlalchemy import select, func, and_, or_, case
 from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.models.producto import Producto
@@ -15,12 +15,13 @@ from app.models.user import User
 from app.models.movimiento_stock import MovimientoStock
 from app.models.deposito import Deposito
 from app.models.stock_producto_deposito import StockProductoDeposito
-from app.services import stock_service
+from app.services import ajuste_stock_service, stock_service
 from app.schemas.producto import (
     ProductoCreate, ProductoUpdate, ProductoResponse, ProductoPublicResponse,
     PreciosBulkUpdate, PreciosPorcentajeUpdate
 )
 from app.schemas.movimiento_stock import StockOperacionRequest
+from app.schemas.stock import MOTIVOS_LABEL
 from app.services.pricing_service import (
     LISTAS,
     MARGEN_FIELDS,
@@ -32,7 +33,7 @@ from app.services.pricing_service import (
     computar_para_update,
     precios_de,
 )
-from app.utils.deps import get_current_user, require_role
+from app.utils.deps import ROLES_MAESTRO_PRODUCTOS, ROLES_STOCK, get_current_user, require_role
 from datetime import datetime, timezone
 from app.utils.filters import apply_column_filters
 
@@ -64,14 +65,11 @@ def _stocks_por_deposito(p: Producto) -> list[dict]:
     return rows
 
 
-# Total de cajas del producto sumando todos los depósitos. Se usa para ordenar y
-# filtrar la grilla, donde interesa "cuánto hay" y no en qué góndola está.
-_STOCK_TOTAL_CAJAS = (
-    select(func.coalesce(func.sum(StockProductoDeposito.cajas), 0))
-    .where(StockProductoDeposito.producto_id == Producto.id)
-    .correlate(Producto)
-    .scalar_subquery()
-)
+# Total de cajas del producto, para ordenar y filtrar la grilla. Sale de la misma
+# expresión que muestra la columna (`stock_service`), normalizando los blísters
+# sueltos a cajas: si no, la grilla mostraba 1050 y filtrar por 1050 no traía
+# nada porque el filtro sumaba sólo la columna `cajas`.
+_STOCK_TOTAL_CAJAS = stock_service.SQL_TOTAL_BLISTERS / stock_service.SQL_POR_CAJA
 
 
 def _producto_to_response(p: Producto) -> dict:
@@ -80,6 +78,14 @@ def _producto_to_response(p: Producto) -> dict:
     d["proveedor_nombre"] = p.proveedor.nombre if p.proveedor else None
     d["laboratorio_nombre"] = p.laboratorio.nombre if p.laboratorio else None
     d["stocks"] = _stocks_por_deposito(p)
+    # Totales y semáforo con la definición canónica (depósitos activos, en
+    # blísters). No cuesta queries: `stocks_deposito` ya viene con selectin.
+    por_caja = p.get_blisters_por_caja
+    total_bl = stock_service.total_blisters_de(p)
+    d["stock_total_blisters"] = total_bl
+    d["stock_total_cajas"] = total_bl // por_caja
+    d["stock_minimo_blisters_total"] = stock_service.minimo_blisters_de(p)
+    d["semaforo_stock"] = stock_service.semaforo_de(p)
     return d
 
 
@@ -97,6 +103,15 @@ async def list_productos(
     solo_nuevos: bool = Query(False, description="Solo productos cargados recientemente"),
     nuevos_dias: int = Query(30, ge=1, le=365, description="Ventana de días para 'producto nuevo'"),
     sin_pvp: bool = Query(False, description="Solo productos sin PVP cargado"),
+    semaforo_stock: str | None = Query(
+        None,
+        pattern="^(rojo|amarillo|verde|sin_minimo)$",
+        description="Filtra por semáforo de stock contra el mínimo configurado",
+    ),
+    bajo_minimo: bool = Query(False, description="Atajo de semaforo_stock=rojo"),
+    incluir_resumen_semaforo: bool = Query(
+        False, description="Agrega el conteo por color del semáforo de stock"
+    ),
     all: bool = Query(False, description="Devolver todos los productos sin paginar (para grilla en memoria)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
@@ -137,6 +152,7 @@ async def list_productos(
         .where(where_clause)
     )
 
+
     base_query = apply_column_filters(
         base_query,
         Producto,
@@ -154,6 +170,17 @@ async def list_productos(
         },
     )
 
+    # El semáforo compara dos columnas (stock contra mínimo), así que no entra por
+    # `apply_column_filters`, que sólo sabe hacer igualdad. Se guarda la consulta
+    # sin este filtro para que el resumen de abajo siga mostrando el panorama
+    # completo aunque el usuario ya haya clickeado un color.
+    query_sin_semaforo = base_query
+    color = "rojo" if bajo_minimo else semaforo_stock
+    if color == "sin_minimo":
+        base_query = base_query.where(stock_service.SQL_MINIMO_BLISTERS <= 0)
+    elif color:
+        base_query = base_query.where(stock_service.SQL_SEMAFORO_STOCK == color)
+
     count_query = select(func.count()).select_from(base_query.subquery())
     total_result = await db.execute(count_query)
     total = total_result.scalar_one()
@@ -170,6 +197,13 @@ async def list_productos(
         "categoria_producto": Producto.categoria_producto,
         "status": Producto.status,
         "stock_total_cajas": _STOCK_TOTAL_CAJAS,
+        # Ordena por criticidad: primero lo que hay que reponer.
+        "semaforo_stock": case(
+            (stock_service.SQL_SEMAFORO_STOCK == "rojo", 0),
+            (stock_service.SQL_SEMAFORO_STOCK == "amarillo", 1),
+            (stock_service.SQL_SEMAFORO_STOCK == "verde", 2),
+            else_=3,
+        ),
     }
     sort_col = _SORT_COLUMNS.get(sort_by, Producto.nombre)
     order_expr = sort_col.desc() if sort_dir == "desc" else sort_col.asc()
@@ -187,12 +221,29 @@ async def list_productos(
     result = await db.execute(query)
     productos = result.scalars().unique().all()
 
-    return {
+    payload = {
         "items": [_producto_to_response(p) for p in productos],
         "total": total,
         "page": 1 if all else page,
         "page_size": total if all else page_size,
     }
+
+    # Conteo por color para los chips de la pantalla de Stock. Es opt-in porque
+    # /productos lo consume media app (la pantalla de venta incluida) y a nadie
+    # más le sirve pagar una query extra.
+    if incluir_resumen_semaforo:
+        sub = query_sin_semaforo.with_only_columns(
+            Producto.id, stock_service.SQL_SEMAFORO_STOCK.label("color")
+        ).subquery()
+        resumen_rows = await db.execute(
+            select(sub.c.color, func.count()).select_from(sub).group_by(sub.c.color)
+        )
+        resumen = {"rojo": 0, "amarillo": 0, "verde": 0, "sin_minimo": 0}
+        for color_row, cantidad in resumen_rows.all():
+            resumen[color_row or "sin_minimo"] = cantidad
+        payload["resumen_semaforo"] = resumen
+
+    return payload
 
 
 async def build_public_catalogo(
@@ -323,6 +374,7 @@ async def descargar_import_template(
     optional_cols = [
         "Laboratorio", "Proveedor", "PVP", "Blisters por caja",
         *stock_cols,
+        "Stock mínimo cajas", "Stock mínimo blisters",
         "Margen Minorista %", "Margen Mayorista %", "Margen Comercio %",
     ]
     headers = required_cols + optional_cols
@@ -753,7 +805,7 @@ async def operacion_stock(
     id: int,
     req: StockOperacionRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role(ROLES_STOCK)),
 ):
     """Ajuste manual o transferencia de stock entre depósitos.
 
@@ -771,11 +823,27 @@ async def operacion_stock(
         tipo = "ADJUST"
 
     if tipo == "ADJUST":
+        if req.motivo not in MOTIVOS_LABEL:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Motivo inválido: {req.motivo!r}. Válidos: {', '.join(MOTIVOS_LABEL)}",
+            )
         dep = await stock_service.validar_deposito(db, req.deposito_id)
-        await stock_service.ajustar(db, producto, dep.id, req.cantidad_cajas, req.cantidad_blisters)
-        # Un ajuste positivo entra al depósito; uno negativo sale de él.
-        entra = (req.cantidad_cajas + req.cantidad_blisters) >= 0
-        origen_id, destino_id = (None, dep.id) if entra else (dep.id, None)
+        # El movimiento lo escribe el servicio: acá no se duplica esa lógica.
+        await ajuste_stock_service.registrar_ajuste(
+            db,
+            producto=producto,
+            deposito_id=dep.id,
+            cajas=req.cantidad_cajas,
+            blisters=req.cantidad_blisters,
+            modo="delta",
+            motivo=req.motivo,
+            usuario_id=current_user.id,
+            observacion=req.observacion,
+        )
+        await db.commit()
+        await db.refresh(producto)
+        return _producto_to_response(producto)
     elif tipo == "TRANSFER":
         origen = await stock_service.validar_deposito(db, req.deposito_id)
         destino = await stock_service.validar_deposito(db, req.deposito_destino_id)
@@ -902,7 +970,7 @@ async def import_productos(
 async def import_productos_excel(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+    _current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
 ):
     """Import products from an XLSX file using the official template."""
     import openpyxl
@@ -1039,6 +1107,23 @@ async def import_productos_excel(
                     f"Fila {row_idx}: 'Blisters por caja' tiene que ser un entero >= 1 ({bl_por_caja!r})"
                 )
 
+        # Mínimo de reposición: sin poder cargarlo por planilla, configurarlo para
+        # todo el catálogo obligaba a abrir la ficha de cada producto.
+        for header, field in (
+            ("stock mínimo cajas", "stock_minimo_cajas"),
+            ("stock mínimo blisters", "stock_minimo_blisters"),
+        ):
+            val = _cell(row, header)
+            if val is None:
+                continue
+            try:
+                n = int(val)
+                if n < 0:
+                    raise ValueError
+                mapped[field] = n
+            except (ValueError, TypeError):
+                errors.append(f"Fila {row_idx}: '{header}' tiene que ser un entero >= 0 ({val!r})")
+
         # Stock por depósito de esta fila: {deposito_id: {"cajas": n, "blisters": n}}
         stock_fila: dict[int, dict[str, int]] = {}
         for header, (dep_id, campo) in STOCK_COLS.items():
@@ -1070,12 +1155,19 @@ async def import_productos_excel(
                 created += 1
 
             for dep_id, cantidades in stock_fila.items():
-                await stock_service.establecer(
+                # Vía el servicio de ajuste y no `establecer` a secas: una planilla
+                # que cambia el stock de 3000 productos tiene que dejar movimiento,
+                # que era justamente lo único que este camino no hacía.
+                await ajuste_stock_service.registrar_ajuste(
                     db,
-                    producto_fila,
-                    dep_id,
-                    cantidades.get("cajas", 0),
-                    cantidades.get("blisters", 0),
+                    producto=producto_fila,
+                    deposito_id=dep_id,
+                    cajas=cantidades.get("cajas", 0),
+                    blisters=cantidades.get("blisters", 0),
+                    modo="absoluto",
+                    motivo="carga_inicial",
+                    usuario_id=_current_user.id,
+                    observacion=f"Import de productos: {file.filename or 'planilla'}"[:200],
                 )
         except Exception as e:
             errors.append(f"Fila {row_idx} ({codigo}): {str(e)}")

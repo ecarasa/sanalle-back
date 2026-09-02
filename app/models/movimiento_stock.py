@@ -27,6 +27,16 @@ class MovimientoStock(Base):
     cantidad_cajas: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     cantidad_blisters: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     
+    # Por qué se movió: recuento_fisico | rotura | vencido | faltante |
+    # error_carga | carga_inicial. Nullable porque los movimientos que ya existían
+    # no tienen uno y no se puede inventar; la obligatoriedad la impone el schema
+    # de entrada, no la columna.
+    motivo: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    # Expediente de la toma de inventario que lo generó, si vino de una.
+    toma_inventario_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("tomas_inventario.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
     observacion: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

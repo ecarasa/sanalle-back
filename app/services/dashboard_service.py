@@ -10,6 +10,7 @@ from app.models.cliente import Cliente
 from app.models.pedido_item import PedidoItem
 from app.models.ingreso_mercaderia import IngresoMercaderia
 from app.models.user import User
+from app.services import semaforo_service, stock_service
 from decimal import Decimal
 
 
@@ -381,25 +382,48 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
     )
     top_vendedores = [{"vendedor": r[0], "total": float(r[1]), "pedidos": r[2]} for r in result.all()]
 
-    # Productos con stock bajo: el total de todos los depósitos contra el mínimo.
-    # Un producto sin ninguna fila de stock cuenta como 0 (de ahí el LEFT JOIN).
-    cajas_totales = func.coalesce(func.sum(StockProductoDeposito.cajas), 0)
+    # Productos con stock bajo. Usa las expresiones de `stock_service` para que el
+    # widget, la grilla de Stock y su filtro digan siempre el mismo número.
+    # Antes se armaba acá con un outerjoin cuyo `Deposito.activo == True` estaba en
+    # el ON: al ser LEFT join no descartaba nada, así que el stock de depósitos
+    # dados de baja igual sumaba y tapaba productos que había que reponer.
+    stock_bajo_where = and_(
+        Producto.activo == True,
+        stock_service.SQL_MINIMO_BLISTERS > 0,
+        stock_service.SQL_TOTAL_BLISTERS <= stock_service.SQL_MINIMO_BLISTERS,
+    )
+    stock_bajo_total = (
+        await db.execute(select(func.count()).select_from(Producto).where(stock_bajo_where))
+    ).scalar_one()
     result = await db.execute(
-        select(Producto.id, Producto.nombre, Producto.codigo, Producto.stock_minimo_cajas, cajas_totales)
-        .select_from(Producto)
-        .outerjoin(StockProductoDeposito, StockProductoDeposito.producto_id == Producto.id)
-        .outerjoin(
-            Deposito,
-            and_(Deposito.id == StockProductoDeposito.deposito_id, Deposito.activo == True),
+        select(
+            Producto.id,
+            Producto.nombre,
+            Producto.codigo,
+            stock_service.SQL_MINIMO_BLISTERS.label("minimo_bl"),
+            stock_service.SQL_TOTAL_BLISTERS.label("total_bl"),
+            stock_service.SQL_POR_CAJA.label("por_caja"),
         )
-        .where(and_(Producto.activo == True, Producto.stock_minimo_cajas > 0))
-        .group_by(Producto.id, Producto.nombre, Producto.codigo, Producto.stock_minimo_cajas)
-        .having(cajas_totales <= Producto.stock_minimo_cajas)
-        .order_by(cajas_totales)
+        .where(stock_bajo_where)
+        .order_by(stock_service.SQL_TOTAL_BLISTERS)
         .limit(20)
     )
     stock_bajo = [
-        {"id": r[0], "nombre": r[1], "codigo": r[2], "stock": int(r[4] or 0), "stock_minimo": r[3]}
+        {
+            "id": r.id,
+            "nombre": r.nombre,
+            "codigo": r.codigo,
+            # En cajas para el número, y el texto con los sueltos: un producto
+            # cuyo mínimo es medio pack se veía como "Stock 0 / Mínimo 0", que
+            # parece un error de carga y no un faltante.
+            "stock": int(r.total_bl or 0) // int(r.por_caja or 1),
+            "stock_minimo": int(r.minimo_bl or 0) // int(r.por_caja or 1),
+            "stock_texto": stock_service.formato_cantidad(int(r.total_bl or 0), int(r.por_caja or 1)),
+            "stock_minimo_texto": stock_service.formato_cantidad(int(r.minimo_bl or 0), int(r.por_caja or 1)),
+            "semaforo": semaforo_service.calcular_semaforo_stock(
+                int(r.total_bl or 0), int(r.minimo_bl or 0)
+            ),
+        }
         for r in result.all()
     ]
 
@@ -463,6 +487,9 @@ async def get_admin_dashboard(db: AsyncSession, mes: str | None = None, desde: s
         "tipos_pago": tipos_pago,
         "top_vendedores": top_vendedores,
         "stock_bajo": stock_bajo,
+        # El total real: la lista de arriba está capada a 20 y el widget mostraba
+        # su largo, así que con 57 productos bajo mínimo decía "20".
+        "stock_bajo_total": stock_bajo_total,
         "ultimos_pagos": ultimos_pagos,
         "pagos_pendientes_imputacion": pagos_pendientes_imputacion,
         "clientes_en_rojo": clientes_en_rojo,

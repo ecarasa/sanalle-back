@@ -7,6 +7,12 @@ from datetime import date
 ACTIVIDAD_VERDE_DIAS = 30
 ACTIVIDAD_AMARILLO_DIAS = 90
 
+# Banda de aviso del semáforo de STOCK: amarillo hasta 1,5x el mínimo.
+# Se expresa como fracción entera para poder escribir la misma comparación en SQL
+# sin floats (total * DEN <= minimo * NUM).
+STOCK_AVISO_NUM = 3
+STOCK_AVISO_DEN = 2
+
 
 def calcular_semaforo_actividad(dias_ultima_compra: int | None) -> str:
     """Semáforo de actividad comercial según los días desde la última compra.
@@ -21,6 +27,26 @@ def calcular_semaforo_actividad(dias_ultima_compra: int | None) -> str:
     if dias_ultima_compra <= ACTIVIDAD_AMARILLO_DIAS:
         return "amarillo"
     return "rojo"
+
+
+def calcular_semaforo_stock(total_blisters: int, minimo_blisters: int) -> str | None:
+    """Semáforo de stock crítico contra el mínimo configurado del producto.
+
+    Se compara en blísters y no en cajas por dos razones: revive
+    `stock_minimo_blisters`, que hoy se carga y no lo lee nadie, y hace que la
+    banda amarilla exista — con mínimo "1 caja" no hay ningún entero entre 1 y
+    1,5, así que en cajas el amarillo nunca se pinta.
+
+    Returns: None si el producto no tiene mínimo configurado (no se pinta),
+    'rojo', 'amarillo' o 'verde'.
+    """
+    if minimo_blisters <= 0:
+        return None
+    if total_blisters <= minimo_blisters:
+        return "rojo"
+    if total_blisters * STOCK_AVISO_DEN <= minimo_blisters * STOCK_AVISO_NUM:
+        return "amarillo"
+    return "verde"
 
 
 def calcular_semaforo(deuda: float, days_overdue: int | None) -> str:

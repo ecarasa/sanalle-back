@@ -8,6 +8,13 @@ from sqlalchemy import select
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
+# Quién puede mover stock: depósito ("operaciones") y administración. Vive acá y
+# no repetido en cada router para que sumar un rol sea un solo cambio.
+# `ventas` queda afuera a propósito: ve el stock, no lo corrige.
+ROLES_STOCK = ["admin", "super_admin", "operaciones"]
+# El maestro de productos (mínimos incluidos) es dato comercial, no de depósito.
+ROLES_MAESTRO_PRODUCTOS = ["admin", "super_admin"]
+
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)

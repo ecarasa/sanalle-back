@@ -7,7 +7,9 @@ from app.core.database import get_db
 from app.models.movimiento_stock import MovimientoStock
 from app.models.producto import Producto
 from app.models.user import User
+from app.models.toma_inventario import TomaInventario
 from app.schemas.movimiento_stock import MovimientoStockResponse
+from app.schemas.stock import MOTIVOS_LABEL, MOTIVOS_MERMA
 from app.utils.deps import get_current_user
 
 router = APIRouter()
@@ -18,6 +20,8 @@ async def list_movimientos_stock(
     producto_id: int | None = Query(None),
     deposito_id: int | None = Query(None),
     tipo_operacion: str | None = Query(None),
+    motivo: str | None = Query(None, description="recuento_fisico, rotura, vencido, ..."),
+    solo_mermas: bool = Query(False, description="Solo los motivos que son pérdida de mercadería"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -42,6 +46,10 @@ async def list_movimientos_stock(
         )
     if tipo_operacion:
         query = query.where(MovimientoStock.tipo_operacion == tipo_operacion)
+    if motivo:
+        query = query.where(MovimientoStock.motivo == motivo)
+    if solo_mermas:
+        query = query.where(MovimientoStock.motivo.in_(MOTIVOS_MERMA))
 
     # Count
     count_query = select(func.count()).select_from(query.subquery())
@@ -53,6 +61,15 @@ async def list_movimientos_stock(
     result = await db.execute(query)
     movimientos = result.scalars().all()
 
+    # Número de la toma de inventario que generó cada movimiento, de una sola vez.
+    toma_ids = {m.toma_inventario_id for m in movimientos if m.toma_inventario_id}
+    numeros_toma: dict[int, str] = {}
+    if toma_ids:
+        filas = await db.execute(
+            select(TomaInventario.id, TomaInventario.numero).where(TomaInventario.id.in_(toma_ids))
+        )
+        numeros_toma = {tid: numero for tid, numero in filas.all()}
+
     items = []
     for m in movimientos:
         res = MovimientoStockResponse.model_validate(m)
@@ -60,6 +77,8 @@ async def list_movimientos_stock(
         res.usuario_nombre = m.usuario.username if m.usuario else "Sistema"
         res.deposito_origen_nombre = m.deposito_origen.nombre if m.deposito_origen else None
         res.deposito_destino_nombre = m.deposito_destino.nombre if m.deposito_destino else None
+        res.motivo_label = MOTIVOS_LABEL.get(m.motivo or "")
+        res.toma_numero = numeros_toma.get(m.toma_inventario_id)
         items.append(res)
 
     return {

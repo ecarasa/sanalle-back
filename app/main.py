@@ -14,6 +14,7 @@ from app.routers import (
 from app.routers import scraper
 from app.routers import chat
 from app.routers import configuracion
+from app.routers import stock
 from app.routers import transacciones
 from app.routers import cuentas
 from app.routers import publico
@@ -87,6 +88,7 @@ app.include_router(cuenta_sanalle.router, prefix="/api/v1/cuenta-sanalle", tags=
 app.include_router(movimientos_stock.router, prefix="/api/v1/movimientos-stock", tags=["MovimientosStock"])
 app.include_router(laboratorios.router, prefix="/api/v1/laboratorios", tags=["Laboratorios"])
 app.include_router(depositos.router, prefix="/api/v1/depositos", tags=["Depositos"])
+app.include_router(stock.router, prefix="/api/v1/stock", tags=["Stock"])
 app.include_router(scraper.router, prefix="/api/v1/scraper", tags=["Scraper"])
 app.include_router(feature_flags.router, prefix="/api/v1/feature-flags", tags=["FeatureFlags"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["Chat"])

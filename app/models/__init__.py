@@ -29,6 +29,7 @@ from app.models.scraper_run import ScraperRun
 from app.models.scraper_run_item import ScraperRunItem
 from app.models.deposito import Deposito
 from app.models.stock_producto_deposito import StockProductoDeposito
+from app.models.toma_inventario import TomaInventario, TomaInventarioItem
 from app.models.chat import ChatConversacion, ChatParticipante, ChatMensaje
 from app.models.configuracion import Configuracion
 from app.models.cuenta import Cuenta
@@ -74,4 +75,6 @@ __all__ = [
     "Entidad",
     "ClienteDireccion",
     "PedidoPlanPago",
+    "TomaInventario",
+    "TomaInventarioItem",
 ]

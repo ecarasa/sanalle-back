@@ -23,12 +23,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import case, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.deposito import Deposito
 from app.models.producto import Producto
 from app.models.stock_producto_deposito import StockProductoDeposito
+from app.services import semaforo_service
 
 
 class StockInsuficiente(HTTPException):
@@ -58,9 +59,92 @@ def _fmt(blisters_totales: int, por_caja: int) -> str:
     return f"{cajas} caja(s) + {sueltos} blíster(s)"
 
 
+def formato_cantidad(blisters_totales: int, por_caja: int) -> str:
+    """'3 caja(s) + 2 blíster(s)'. Público: lo usan las pantallas, no sólo los errores."""
+    return _fmt(blisters_totales, por_caja)
+
+
 def a_blisters(producto: Producto, cajas: int, blisters: int) -> int:
     """Convierte una cantidad mixta a la unidad interna (blísters)."""
     return cajas * producto.get_blisters_por_caja + blisters
+
+
+# --- Expresiones SQL del stock total y del semáforo ---------------------------
+# Hay una sola definición de "cuánto hay" y vive acá: la grilla de productos, el
+# filtro de bajo mínimo y el widget del dashboard la importan. Antes cada uno
+# sumaba a su manera y bastaba con dar de baja un depósito para que los tres
+# dieran números distintos del mismo producto.
+#
+# Alcance: depósitos ACTIVOS y stock FÍSICO. Lo reservado no cuenta: ya está
+# comprometido en pedidos y hay que reponerlo igual.
+
+# Espeja `Producto.get_blisters_por_caja` (nunca 0, para no dividir por cero).
+SQL_POR_CAJA = func.greatest(func.coalesce(Producto.blisters_por_caja, 1), 1)
+
+SQL_TOTAL_BLISTERS = (
+    select(
+        func.coalesce(
+            func.sum(
+                StockProductoDeposito.cajas * SQL_POR_CAJA + StockProductoDeposito.blisters
+            ),
+            0,
+        )
+    )
+    .select_from(StockProductoDeposito)
+    .join(Deposito, Deposito.id == StockProductoDeposito.deposito_id)
+    .where(
+        StockProductoDeposito.producto_id == Producto.id,
+        Deposito.activo.is_(True),
+    )
+    .correlate(Producto)
+    .scalar_subquery()
+)
+
+SQL_MINIMO_BLISTERS = (
+    func.coalesce(Producto.stock_minimo_cajas, 0) * SQL_POR_CAJA
+    + func.coalesce(Producto.stock_minimo_blisters, 0)
+)
+
+# Mismo criterio que `semaforo_service.calcular_semaforo_stock`, en SQL.
+SQL_SEMAFORO_STOCK = case(
+    (SQL_MINIMO_BLISTERS <= 0, literal(None)),
+    (SQL_TOTAL_BLISTERS <= SQL_MINIMO_BLISTERS, literal("rojo")),
+    (
+        SQL_TOTAL_BLISTERS * semaforo_service.STOCK_AVISO_DEN
+        <= SQL_MINIMO_BLISTERS * semaforo_service.STOCK_AVISO_NUM,
+        literal("amarillo"),
+    ),
+    else_=literal("verde"),
+)
+
+
+def total_blisters_de(producto: Producto) -> int:
+    """Stock total en blísters sumando los depósitos activos.
+
+    Versión Python de `SQL_TOTAL_BLISTERS`, para armar la respuesta sin pegarle
+    otra vez a la base: `Producto.stocks_deposito` ya viene con `selectin`.
+    """
+    por_caja = producto.get_blisters_por_caja
+    return sum(
+        st.cajas * por_caja + st.blisters
+        for st in (producto.stocks_deposito or [])
+        if st.deposito is None or st.deposito.activo
+    )
+
+
+def minimo_blisters_de(producto: Producto) -> int:
+    """Mínimo de reposición del producto, en blísters."""
+    return (
+        (producto.stock_minimo_cajas or 0) * producto.get_blisters_por_caja
+        + (producto.stock_minimo_blisters or 0)
+    )
+
+
+def semaforo_de(producto: Producto) -> str | None:
+    """Semáforo de stock del producto. None = sin mínimo configurado."""
+    return semaforo_service.calcular_semaforo_stock(
+        total_blisters_de(producto), minimo_blisters_de(producto)
+    )
 
 
 @dataclass(frozen=True)

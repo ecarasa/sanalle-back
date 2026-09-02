@@ -7,6 +7,8 @@ class MovimientoStockBase(BaseModel):
     producto_id: int
     # ADJUST, TRANSFER, INGRESO, NC_RETURN, ND_ADJUST
     tipo_operacion: str
+    # Por qué se movió (solo en los ajustes). Ver `app/schemas/stock.py`.
+    motivo: Optional[str] = None
     deposito_origen_id: Optional[int] = None
     deposito_destino_id: Optional[int] = None
     cantidad_cajas: int = 0
@@ -26,6 +28,9 @@ class MovimientoStockResponse(MovimientoStockBase):
     producto_nombre: Optional[str] = None
     deposito_origen_nombre: Optional[str] = None
     deposito_destino_nombre: Optional[str] = None
+    motivo_label: Optional[str] = None
+    toma_inventario_id: Optional[int] = None
+    toma_numero: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -43,4 +48,7 @@ class StockOperacionRequest(BaseModel):
     deposito_destino_id: Optional[int] = None
     cantidad_cajas: int = 0
     cantidad_blisters: int = 0
+    # Obligatorio en ADJUST: es lo que convierte "alguien tocó el stock" en un
+    # dato agrupable. En TRANSFER no aplica (la mercadería no se pierde ni aparece).
+    motivo: Optional[str] = None
     observacion: Optional[str] = None

@@ -101,6 +101,12 @@ class ProductoResponse(ProductoBase):
     stocks: list[StockDepositoResponse] = []
     proveedor_nombre: Optional[str] = None
     laboratorio_nombre: Optional[str] = None
+    # Totales de depósitos activos y semáforo contra el mínimo. Los calcula el
+    # router con `stock_service`, que es donde vive la única definición.
+    stock_total_cajas: int = 0
+    stock_total_blisters: int = 0
+    stock_minimo_blisters_total: int = 0
+    semaforo_stock: Optional[str] = None  # 'rojo' | 'amarillo' | 'verde' | None
     created_at: datetime
     updated_at: datetime
 
