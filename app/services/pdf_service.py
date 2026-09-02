@@ -42,20 +42,33 @@ def numero_a_letras(importe: float) -> str:
     return f"{texto} PESOS ARGENTINOS CON {centavos:02d}/100"
 
 
-def _draw_page_header_footer(canvas, doc, title_text: str, doc_number: str):
-    """Draw consistent header and footer on every page."""
+def _draw_page_header_footer(canvas, doc, title_text: str, doc_number: str, *, con_marca: bool = False):
+    """Draw consistent header and footer on every page.
+
+    `con_marca` sólo va en los documentos internos (hoja de ruta, orden de
+    compra). Los que se le entregan al cliente no llevan el nombre del sistema:
+    ese nombre no es el de la empresa que vende y en un remito se lee como si lo
+    fuera.
+    """
     canvas.saveState()
 
     # --- Header bar (banda azul + acento celeste) ---
-    canvas.setFillColor(BLUE_DARK)
-    canvas.rect(0, PAGE_H - 28, PAGE_W, 28, fill=1, stroke=0)
-    canvas.setFillColor(CELESTE)
-    canvas.rect(0, PAGE_H - 31, PAGE_W, 3, fill=1, stroke=0)
-    canvas.setFillColor(white)
-    canvas.setFont("Helvetica-Bold", 9)
-    canvas.drawString(doc.leftMargin, PAGE_H - 20, f"{APP_NAME}")
-    canvas.setFont("Helvetica", 8)
-    canvas.drawRightString(PAGE_W - doc.rightMargin, PAGE_H - 20, f"{title_text}  |  {doc_number}")
+    if con_marca:
+        canvas.setFillColor(BLUE_DARK)
+        canvas.rect(0, PAGE_H - 28, PAGE_W, 28, fill=1, stroke=0)
+        canvas.setFillColor(CELESTE)
+        canvas.rect(0, PAGE_H - 31, PAGE_W, 3, fill=1, stroke=0)
+        canvas.setFillColor(white)
+        canvas.setFont("Helvetica-Bold", 9)
+        canvas.drawString(doc.leftMargin, PAGE_H - 20, f"{APP_NAME}")
+        canvas.setFont("Helvetica", 8)
+        canvas.drawRightString(PAGE_W - doc.rightMargin, PAGE_H - 20, f"{title_text}  |  {doc_number}")
+    else:
+        # Sin banda, pero con la referencia del comprobante: es lo único que
+        # identifica la hoja 2 de un remito largo.
+        canvas.setFillColor(LABEL_GREY)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawRightString(PAGE_W - doc.rightMargin, PAGE_H - 20, f"{title_text}  |  {doc_number}")
 
     # --- Footer ---
     canvas.setStrokeColor(colors.grey)
@@ -67,9 +80,10 @@ def _draw_page_header_footer(canvas, doc, title_text: str, doc_number: str):
     canvas.drawString(doc.leftMargin, 24, "Documento no válido como factura")
     canvas.drawRightString(PAGE_W - doc.rightMargin, 24, f"Página {doc.page}")
 
-    canvas.setFillColor(BLUE)
-    canvas.setFont("Helvetica", 7)
-    canvas.drawCentredString(PAGE_W / 2, 14, f"{APP_NAME} © {datetime.now().year}  —  Droguería y Distribuidora de Medicamentos")
+    if con_marca:
+        canvas.setFillColor(BLUE)
+        canvas.setFont("Helvetica", 7)
+        canvas.drawCentredString(PAGE_W / 2, 14, f"{APP_NAME} © {datetime.now().year}  —  Droguería y Distribuidora de Medicamentos")
 
     canvas.restoreState()
 
@@ -78,8 +92,6 @@ def _get_styles():
     """Return a dict of reusable paragraph styles."""
     base = getSampleStyleSheet()
     return {
-        "title": ParagraphStyle('PDFTitle', parent=base['Title'], fontSize=18, textColor=BLUE, spaceAfter=4),
-        "subtitle": ParagraphStyle('PDFSubtitle', parent=base['Normal'], fontSize=14, textColor=RED, alignment=TA_CENTER, spaceAfter=10, spaceBefore=4),
         "normal": ParagraphStyle('PDFNormal', parent=base['Normal'], fontSize=9, leading=12),
         "normal_sm": ParagraphStyle('PDFNormalSm', parent=base['Normal'], fontSize=8, leading=10),
         "small": ParagraphStyle('PDFSmall', parent=base['Normal'], fontSize=7, textColor=colors.grey),
@@ -88,7 +100,6 @@ def _get_styles():
         "right_bold": ParagraphStyle('PDFRightBold', parent=base['Normal'], fontSize=10, alignment=TA_RIGHT),
         "center": ParagraphStyle('PDFCenter', parent=base['Normal'], fontSize=9, alignment=TA_CENTER, leading=12),
         "right": ParagraphStyle('PDFRight', parent=base['Normal'], fontSize=9, alignment=TA_RIGHT, leading=12),
-        "company_sub": ParagraphStyle('PDFCompSub', parent=base['Normal'], fontSize=9, textColor=BLUE, alignment=TA_CENTER),
     }
 
 
@@ -122,20 +133,6 @@ def _product_table_style(num_rows: int):
     return TableStyle(cmds)
 
 
-def _build_company_header(elements, s, sub_title: str):
-    """Append the company header block (used on the first page body)."""
-    elements.append(Paragraph(settings.APP_NAME, s["title"]))
-    elements.append(Paragraph("Droguería y Distribuidora de Medicamentos", s["company_sub"]))
-    elements.append(Spacer(1, 5 * mm))
-    elements.append(Paragraph(sub_title, s["subtitle"]))
-    elements.append(Spacer(1, 2 * mm))
-    elements.append(Paragraph(
-        "CUIT: 30-12345678-9 | Domicilio: Av. Corrientes 1234, CABA | Resp. Inscripto",
-        s["small"],
-    ))
-    elements.append(Spacer(1, 5 * mm))
-
-
 # ---------------------------------------------------------------------------
 # RECIBO / REMITO PDF
 # ---------------------------------------------------------------------------
@@ -160,12 +157,14 @@ def generate_pago_recibo_pdf(
     )
     s = _get_styles()
     elements = []
+    content_w = PAGE_W - doc.leftMargin - doc.rightMargin
 
-    # --- Company header ---
-    _build_company_header(elements, s, doc_title)
+    fecha_str = str(pago_data.get('fecha_recepcion', ''))[:10]
+
+    # --- Encabezado del comprobante (sin marca: se lo lleva el cliente) ---
+    _build_doc_header(elements, content_w, doc_title, [f"N° {doc_number}", f"Fecha: {fecha_str}"])
 
     # --- Header Info ---
-    fecha_str = str(pago_data.get('fecha_recepcion', ''))[:10]
     info_data = [
         [Paragraph('<b>Fecha de Recibo</b>', s["normal"]), Paragraph(fecha_str, s["normal"]),
          Paragraph('<b>N° de Control</b>', s["normal"]), Paragraph(doc_number, s["normal"])],
@@ -319,12 +318,14 @@ def generate_recibo_pdf(
     )
     s = _get_styles()
     elements = []
+    content_w = PAGE_W - doc.leftMargin - doc.rightMargin
 
-    # --- Company header ---
-    _build_company_header(elements, s, doc_title)
+    fecha_str = str(pago_data.get('fecha_recepcion', ''))[:10]
+
+    # --- Encabezado del comprobante (sin marca: se lo lleva el cliente) ---
+    _build_doc_header(elements, content_w, doc_title, [f"N° {doc_number}", f"Fecha: {fecha_str}"])
 
     # --- Client / payment info ---
-    fecha_str = str(pago_data.get('fecha_recepcion', ''))[:10]
     info_data = [
         [Paragraph('<b>Fecha Pago</b>', s["normal"]), Paragraph(fecha_str, s["normal"]),
          Paragraph('<b>N° Recibo</b>', s["normal"]), Paragraph(doc_number, s["normal"])],
@@ -504,33 +505,59 @@ def _kv_card(title_text: str, kv: list[tuple[str, object]], col_widths: list[flo
     return t
 
 
-def _build_brand_header(elements: list, content_w: float, badge_title: str, badge_lines: list[str]) -> None:
-    """Encabezado consistente: marca (izq) + credencial en recuadro azul (der) + regla celeste.
+def _build_doc_header(
+    elements: list,
+    content_w: float,
+    badge_title: str,
+    badge_lines: list[str],
+    *,
+    con_marca: bool = False,
+    etiqueta_copia: str | None = None,
+) -> None:
+    """Encabezado consistente: credencial en recuadro azul + regla celeste.
 
     `badge_lines`: la primera línea va destacada (azul, negrita); el resto en gris.
+    `con_marca` agrega a la izquierda el nombre del sistema: sólo para los
+    documentos internos. `etiqueta_copia` rotula ORIGINAL / DUPLICADO /
+    TRIPLICADO dentro del recuadro.
     """
     brand_title = ParagraphStyle('_bt', fontName='Helvetica-Bold', fontSize=20, textColor=BLUE, leading=22)
     brand_sub = ParagraphStyle('_bs', fontName='Helvetica', fontSize=9, textColor=LABEL_GREY, leading=12)
     badge_tipo = ParagraphStyle('_bti', fontName='Helvetica-Bold', fontSize=13, textColor=white, alignment=TA_CENTER, leading=15)
     badge_num = ParagraphStyle('_bnu', fontName='Helvetica-Bold', fontSize=11, textColor=BLUE, alignment=TA_CENTER, leading=13)
     badge_sub = ParagraphStyle('_bfe', fontName='Helvetica', fontSize=8, textColor=LABEL_GREY, alignment=TA_CENTER, leading=11)
+    badge_copia = ParagraphStyle('_bco', fontName='Helvetica-Bold', fontSize=9, textColor=LABEL_GREY, alignment=TA_CENTER, leading=12)
 
     badge_rows = [[Paragraph(badge_title, badge_tipo)]]
     for i, line in enumerate(badge_lines):
         badge_rows.append([Paragraph(line, badge_num if i == 0 else badge_sub)])
-    doc_badge = Table(badge_rows, colWidths=[content_w * 0.36])
-    doc_badge.setStyle(TableStyle([
+    if etiqueta_copia:
+        badge_rows.append([Paragraph(etiqueta_copia, badge_copia)])
+    badge_w = content_w * 0.36
+    doc_badge = Table(badge_rows, colWidths=[badge_w])
+    badge_style = [
         ('BOX', (0, 0), (-1, -1), 0.8, BLUE),
         ('BACKGROUND', (0, 0), (0, 0), BLUE),
         ('LINEBELOW', (0, 0), (0, 0), 2, CELESTE),
         ('TOPPADDING', (0, 0), (-1, -1), 5),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-    ]))
+    ]
+    if etiqueta_copia:
+        badge_style.append(('LINEABOVE', (0, -1), (0, -1), 0.4, CARD_BORDER))
+    doc_badge.setStyle(TableStyle(badge_style))
 
-    header_tbl = Table([[
-        [Paragraph(APP_NAME, brand_title), Paragraph("Droguería y Distribuidora de Medicamentos", brand_sub)],
-        doc_badge,
-    ]], colWidths=[content_w * 0.60, content_w * 0.40])
+    if con_marca:
+        header_row = [
+            [Paragraph(APP_NAME, brand_title), Paragraph("Droguería y Distribuidora de Medicamentos", brand_sub)],
+            doc_badge,
+        ]
+        col_widths = [content_w * 0.60, content_w * 0.40]
+    else:
+        # Sin bloque de marca el recuadro queda solo: se alinea a la derecha
+        # contra una celda vacía para no quedar flotando al medio de la hoja.
+        header_row = ['', doc_badge]
+        col_widths = [content_w - badge_w, badge_w]
+    header_tbl = Table([header_row], colWidths=col_widths)
     header_tbl.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('LEFTPADDING', (0, 0), (-1, -1), 0),
@@ -544,31 +571,64 @@ def _build_brand_header(elements: list, content_w: float, badge_title: str, badg
     elements.append(Spacer(1, 5 * mm))
 
 
-def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: str, items: list[dict]) -> str:
-    filename = f"{pedido_data['numero_pedido']}.pdf"
-    filepath = os.path.join(settings.PDF_STORAGE_PATH, filename)
-    os.makedirs(settings.PDF_STORAGE_PATH, exist_ok=True)
+def _bloque_recibi_conforme(content_w: float) -> Table:
+    """Recuadro de conformidad al pie del remito.
 
+    El remito vuelve firmado por quien recibe la mercadería; sin un espacio
+    previsto la firma termina escrita encima del detalle de productos.
+    """
+    title_st = ParagraphStyle('_rct', fontName='Helvetica-Bold', fontSize=8, textColor=white, leading=11)
+    lbl_st = ParagraphStyle('_rcl', fontName='Helvetica', fontSize=7, textColor=LABEL_GREY, alignment=TA_CENTER, leading=9)
+    col = content_w / 4
+    box = Table([
+        [Paragraph("RECIBÍ CONFORME", title_st), '', '', ''],
+        ['', '', '', ''],
+        [Paragraph("Firma", lbl_st), Paragraph("Aclaración", lbl_st),
+         Paragraph("DNI", lbl_st), Paragraph("Fecha", lbl_st)],
+    ], colWidths=[col] * 4, rowHeights=[None, 18 * mm, None])
+    box.setStyle(TableStyle([
+        ('SPAN', (0, 0), (-1, 0)),
+        ('BACKGROUND', (0, 0), (-1, 0), BLUE),
+        ('BOX', (0, 0), (-1, -1), 0.6, CARD_BORDER),
+        ('LINEBEFORE', (0, 0), (0, -1), 3, CELESTE),
+        ('LINEAFTER', (0, 1), (-2, 2), 0.4, CARD_BORDER),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('LEFTPADDING', (0, 0), (-1, -1), 9),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+    ]))
+    return box
+
+
+def _remito_flowables(
+    *,
+    s: dict,
+    content_w: float,
+    pedido_data: dict,
+    cliente_data: dict,
+    vendedor_nombre: str,
+    items: list[dict],
+    etiqueta_copia: str | None = None,
+) -> list:
+    """Arma el cuerpo del remito. Se llama una vez por copia."""
     tipo_doc = str(pedido_data.get('tipo_documento', 'remito') or 'remito').upper()
     doc_number = pedido_data['numero_pedido']
-    doc_title = f"{tipo_doc} - {doc_number}"
-
-    doc = SimpleDocTemplate(
-        filepath, pagesize=A4,
-        topMargin=2.2 * cm, bottomMargin=2 * cm,
-        leftMargin=1.8 * cm, rightMargin=1.8 * cm,
-    )
-    s = _get_styles()
-    elements = []
+    modalidad = str(pedido_data.get('modalidad_entrega') or 'envio')
 
     fecha_str = str(pedido_data.get('fecha', ''))[:10]
     fecha_ent = str(pedido_data.get('fecha_entrega', '') or '-')[:10]
     shipping = str(pedido_data.get('shipping_status', ''))
     payment = str(pedido_data.get('payment_status', ''))
-    content_w = PAGE_W - doc.leftMargin - doc.rightMargin
 
-    # --- Encabezado: marca (izq) + credencial del comprobante (der) ---
-    _build_brand_header(elements, content_w, tipo_doc, [f"N° {doc_number}", f"Fecha: {fecha_str}"])
+    elements: list = []
+
+    # --- Encabezado: credencial del comprobante (sin marca del sistema) ---
+    _build_doc_header(
+        elements, content_w, tipo_doc,
+        [f"N° {doc_number}", f"Fecha: {fecha_str}"],
+        etiqueta_copia=etiqueta_copia,
+    )
 
     # --- Dos tarjetas: Cliente | Comprobante ---
     card_w = (content_w - 14) / 2
@@ -586,16 +646,19 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
     if cliente_data.get('telefono'):
         cli_kv.append(("TELÉFONO", str(cliente_data.get('telefono'))))
 
+    # El transporte se muestra en la tarjeta de entrega, y sólo cuando hay envío.
     comp_kv: list[tuple[str, object]] = [
         ("N° PEDIDO", doc_number),
         ("FECHA", fecha_str),
         ("ENTREGA", fecha_ent),
         ("VENDEDOR", str(vendedor_nombre or '-')),
-        ("TRANSPORTE", str(pedido_data.get('transporte') or '-')),
-        ("DEPÓSITO", ", ".join(pedido_data.get('depositos') or []) or '-'),
         ("DESPACHO", _estado_badge(shipping)),
         ("PAGO", _estado_badge(payment)),
     ]
+    if modalidad != 'retira':
+        # En el retiro el depósito es el dato central de la entrega y ya sale en
+        # su propia tarjeta: acá quedaría repetido.
+        comp_kv.insert(4, ("DEPÓSITO", ", ".join(pedido_data.get('depositos') or []) or '-'))
 
     cards = Table([[
         _kv_card("DATOS DEL CLIENTE", cli_kv, inner),
@@ -608,6 +671,27 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
     ]))
     elements.append(cards)
+    elements.append(Spacer(1, 6 * mm))
+
+    # --- Cómo se entrega: lo que cambia entre retiro y envío ---
+    ent_lbl_w = 90
+    if modalidad == 'retira':
+        entrega_kv: list[tuple[str, object]] = [
+            ("MODALIDAD", "Retira por depósito"),
+            ("DEPÓSITO", ", ".join(pedido_data.get('depositos') or []) or '-'),
+        ]
+        entrega_titulo = "RETIRO POR DEPÓSITO"
+    else:
+        entrega_kv = [
+            ("MODALIDAD", "Envío a domicilio"),
+            # La dirección del pedido, no la fiscal del cliente: puede ser una
+            # sucursal o un depósito distinto al del domicilio.
+            ("DIRECCIÓN", str(pedido_data.get('direccion_entrega') or cliente_data.get('domicilio') or '-')),
+            ("TRANSPORTE", str(pedido_data.get('transporte') or '-')),
+            ("BULTOS", str(pedido_data.get('bultos') or 0)),
+        ]
+        entrega_titulo = "ENTREGA"
+    elements.append(_kv_card(entrega_titulo, entrega_kv, [ent_lbl_w, content_w - ent_lbl_w]))
     elements.append(Spacer(1, 6 * mm))
 
     # --- Products (paginated, header repeats) ---
@@ -758,10 +842,63 @@ def generate_pedido_pdf(pedido_data: dict, cliente_data: dict, vendedor_nombre: 
         elements.append(obs_box)
         elements.append(Spacer(1, 5 * mm))
 
+    elements.append(KeepTogether(_bloque_recibi_conforme(content_w)))
+
+    return elements
+
+
+def generate_pedido_pdf(
+    pedido_data: dict,
+    cliente_data: dict,
+    vendedor_nombre: str,
+    items: list[dict],
+    *,
+    sin_valores: bool = False,
+) -> str:
+    # `sin_valores` sólo desambigua el archivo: los importes ya vienen en cero
+    # desde el router. Sin el sufijo las dos variantes escriben el mismo nombre
+    # en el volumen compartido y una puede pisar a la otra entre el build y la
+    # respuesta — justo la copia sin valores es la que nunca debe llevar precios.
+    filename = f"{pedido_data['numero_pedido']}{'_SV' if sin_valores else ''}.pdf"
+    filepath = os.path.join(settings.PDF_STORAGE_PATH, filename)
+    os.makedirs(settings.PDF_STORAGE_PATH, exist_ok=True)
+
+    tipo_doc = str(pedido_data.get('tipo_documento', 'remito') or 'remito').upper()
+    doc_number = pedido_data['numero_pedido']
+    doc_title = f"{tipo_doc} - {doc_number}"
+    modalidad = str(pedido_data.get('modalidad_entrega') or 'envio')
+
+    doc = SimpleDocTemplate(
+        filepath, pagesize=A4,
+        topMargin=2.2 * cm, bottomMargin=2 * cm,
+        leftMargin=1.8 * cm, rightMargin=1.8 * cm,
+    )
+    s = _get_styles()
+    content_w = PAGE_W - doc.leftMargin - doc.rightMargin
+
+    # El transporte se queda con una copia, el cliente con otra y la tercera
+    # vuelve firmada. En el retiro por depósito alcanza con una.
+    copias = ["ORIGINAL", "DUPLICADO", "TRIPLICADO"] if modalidad != 'retira' else [None]
+
+    elements: list = []
+    for i, etiqueta in enumerate(copias):
+        if i:
+            elements.append(PageBreak())
+        elements.extend(_remito_flowables(
+            s=s,
+            content_w=content_w,
+            pedido_data=pedido_data,
+            cliente_data=cliente_data,
+            vendedor_nombre=vendedor_nombre,
+            items=items,
+            etiqueta_copia=etiqueta,
+        ))
+
     # Build with per-page header/footer
     on_page = partial(_draw_page_header_footer, title_text=doc_title, doc_number=doc_number)
     doc.build(elements, onFirstPage=on_page, onLaterPages=on_page)
     return filename
+
 
 
 # ---------------------------------------------------------------------------
@@ -787,9 +924,10 @@ def generate_hoja_ruta_pdf(fecha: str, paradas: list[dict]) -> str:
     total_bultos = sum(int(p.get('bultos', 0) or 0) for p in paradas)
 
     # --- Encabezado con la credencial de la ruta ---
-    _build_brand_header(
+    _build_doc_header(
         elements, content_w, "HOJA DE RUTA",
         [f"Fecha: {fecha or '-'}", f"{len(paradas)} paradas · {total_bultos} bultos"],
+        con_marca=True,
     )
 
     header_row = [
@@ -828,7 +966,7 @@ def generate_hoja_ruta_pdf(fecha: str, paradas: list[dict]) -> str:
     tbl.setStyle(_product_table_style(len(rows)))
     elements.append(tbl)
 
-    on_page = partial(_draw_page_header_footer, title_text=title, doc_number="")
+    on_page = partial(_draw_page_header_footer, title_text=title, doc_number="", con_marca=True)
     doc.build(elements, onFirstPage=on_page, onLaterPages=on_page)
     return filename
 
@@ -866,7 +1004,7 @@ def generate_orden_compra_pdf(ingreso_data: dict, proveedor_data: dict, items: l
     content_w = PAGE_W - doc.leftMargin - doc.rightMargin
 
     # --- Encabezado ---
-    _build_brand_header(elements, content_w, "ORDEN DE COMPRA", [f"N° {doc_number}", f"Fecha: {fecha_str}"])
+    _build_doc_header(elements, content_w, "ORDEN DE COMPRA", [f"N° {doc_number}", f"Fecha: {fecha_str}"], con_marca=True)
 
     # --- Dos tarjetas: Proveedor | Orden ---
     card_w = (content_w - 14) / 2
@@ -1070,7 +1208,7 @@ def generate_orden_compra_pdf(ingreso_data: dict, proveedor_data: dict, items: l
     sig_tbl = Table(sig_data, colWidths=[240, 240])
     elements.append(sig_tbl)
 
-    on_page = partial(_draw_page_header_footer, title_text=doc_title, doc_number=doc_number)
+    on_page = partial(_draw_page_header_footer, title_text=doc_title, doc_number=doc_number, con_marca=True)
     doc.build(elements, onFirstPage=on_page, onLaterPages=on_page)
     return filename
 
@@ -1112,12 +1250,16 @@ def generate_estado_cuenta_pdf(
     )
     s = _get_styles()
     elements = []
-
-    # --- Company header ---
-    _build_company_header(elements, s, doc_title)
+    content_w = PAGE_W - doc.leftMargin - doc.rightMargin
 
     # --- Header Info ---
     fecha_emision = time.strftime("%Y-%m-%d %H:%M")
+
+    # --- Encabezado del comprobante (sin marca: se lo lleva el cliente) ---
+    _build_doc_header(
+        elements, content_w, "ESTADO DE CUENTA",
+        [suffix.lstrip(" -"), f"Emitido: {fecha_emision}"],
+    )
     periodo = "Histórico"
     if fecha_desde and fecha_hasta:
         periodo = f"Desde {fecha_desde} hasta {fecha_hasta}"

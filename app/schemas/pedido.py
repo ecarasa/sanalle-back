@@ -5,6 +5,18 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+# Espeja `ModalidadEntrega` de app/models/pedido.py. La columna es texto, así que
+# esta validación es la que evita que entre un valor que el remito no sabe armar.
+MODALIDADES_ENTREGA = ("envio", "retira")
+
+
+def _validar_modalidad(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return v
+    if v not in MODALIDADES_ENTREGA:
+        raise ValueError(f"modalidad_entrega inválida: {v!r}. Válidas: {', '.join(MODALIDADES_ENTREGA)}")
+    return v
+
 
 class PedidoItemBase(BaseModel):
     producto_id: int
@@ -74,6 +86,8 @@ class PedidoBase(BaseModel):
     tipo_documento: Optional[str] = None
     saldo_pendiente: Optional[float] = None
     transporte: Optional[str] = None
+    # 'envio' | 'retira'. None = que el backend lo resuelva a partir del cliente.
+    modalidad_entrega: Optional[str] = None
     # Dirección de entrega elegida de la libreta del cliente. `direccion_entrega`
     # es el texto que queda guardado en el pedido (la foto del momento).
     direccion_entrega_id: Optional[int] = None
@@ -86,6 +100,11 @@ class PedidoBase(BaseModel):
     # False = el pedido no compromete mercadería. Para operaciones de volumen que
     # se facturan antes de que entre el ingreso del proveedor.
     reserva_stock: bool = True
+
+    @field_validator("modalidad_entrega")
+    @classmethod
+    def _chk_modalidad(cls, v: Optional[str]) -> Optional[str]:
+        return _validar_modalidad(v)
 
 
 class PedidoCreate(PedidoBase):
@@ -101,6 +120,7 @@ class PedidoUpdate(BaseModel):
     observacion: Optional[str] = None
     tipo_documento: Optional[str] = None
     transporte: Optional[str] = None
+    modalidad_entrega: Optional[str] = None
     direccion_entrega_id: Optional[int] = None
     direccion_entrega: Optional[str] = None
     fecha_compromiso_pago: Optional[date] = None
@@ -112,6 +132,11 @@ class PedidoUpdate(BaseModel):
     items: Optional[list[PedidoItemCreate]] = None
     # None = no tocar. Una lista (aunque sea vacía) reemplaza el plan entero.
     plan_pago: Optional[list[PedidoPlanPagoCreate]] = None
+
+    @field_validator("modalidad_entrega")
+    @classmethod
+    def _chk_modalidad(cls, v: Optional[str]) -> Optional[str]:
+        return _validar_modalidad(v)
 
 
 class PedidoLogisticaUpdate(BaseModel):
@@ -159,6 +184,7 @@ class PedidoResponse(BaseModel):
     fecha: date
     fecha_entrega: Optional[date] = None
     transporte: Optional[str] = None
+    modalidad_entrega: str = "envio"
     fecha_compromiso_pago: Optional[date] = None
     despachado: bool = False
     sociedad: Optional[str] = None

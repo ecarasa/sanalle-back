@@ -45,6 +45,12 @@ class TipoDocumento(enum.Enum):
     factura = "factura"
 
 
+class ModalidadEntrega(str, enum.Enum):
+    """Cómo llega la mercadería al cliente. Define qué remito se imprime."""
+    envio = "envio"      # se despacha a la dirección de entrega del pedido
+    retira = "retira"    # el cliente pasa a buscarlo por el depósito
+
+
 # Estados que no representan una venta cerrable: se excluyen de la deuda del
 # cliente, de la cuenta corriente, del dashboard y de la imputación de pagos.
 ESTADOS_NO_COMPUTABLES = (EstadoDespacho.borrador, EstadoDespacho.cancelado)
@@ -83,6 +89,17 @@ class Pedido(Base):
     fecha: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     fecha_entrega: Mapped[date | None] = mapped_column(Date, nullable=True)
     transporte: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Modalidad de entrega. Es columna propia y no se deduce del texto de
+    # `transporte` ("Retira el cliente" es uno de los valores sugeridos): de esto
+    # dependen la dirección que sale impresa y cuántas copias se emiten, y un
+    # typo en un campo libre no puede decidir eso.
+    modalidad_entrega: Mapped[str] = mapped_column(
+        String(20),
+        default=ModalidadEntrega.envio.value,
+        server_default="envio",
+        nullable=False,
+        index=True,
+    )
     fecha_compromiso_pago: Mapped[date | None] = mapped_column(Date, nullable=True)
     despachado: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     sociedad: Mapped[str | None] = mapped_column(String(20), nullable=True)  # "sanalle" | "farmacare"

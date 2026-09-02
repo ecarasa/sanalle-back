@@ -311,6 +311,15 @@ async def _recordar_transporte(db: AsyncSession, cliente_id: int, transporte: st
         cliente.transporte_habitual = valor
 
 
+def _modalidad_por_defecto(cliente: Cliente) -> str:
+    """Propone la modalidad a partir del transporte habitual del cliente.
+
+    Mismo criterio que el transporte en el alta: si el cliente siempre pasa a
+    buscar el pedido, no hay que volver a marcarlo en cada uno.
+    """
+    return "retira" if "retira" in (cliente.transporte_habitual or "").lower() else "envio"
+
+
 async def _aplicar_cambio_reserva(db: AsyncSession, pedido: Pedido, *, activar: bool) -> None:
     """Prende o apaga la reserva de todas las líneas de un pedido ya cargado.
 
@@ -450,6 +459,7 @@ def _build_pedido_response(pedido: Pedido) -> PedidoResponse:
         fecha=pedido.fecha,
         fecha_entrega=pedido.fecha_entrega,
         transporte=pedido.transporte,
+        modalidad_entrega=pedido.modalidad_entrega,
         fecha_compromiso_pago=pedido.fecha_compromiso_pago,
         despachado=pedido.despachado,
         sociedad=pedido.sociedad,
@@ -625,7 +635,7 @@ async def list_pedidos(
         allowed_columns={
             "numero_pedido", "shipping_status", "payment_status", "fecha", "fecha_entrega",
             "importe_total", "cliente_nombre", "vendedor_nombre", "tipo_documento",
-            "transporte", "sociedad", "despachado", "tipo_precio", "saldo_pendiente",
+            "transporte", "modalidad_entrega", "sociedad", "despachado", "tipo_precio", "saldo_pendiente",
             "repartidor_id", "repartidor_nombre",
         },
         extra_mappings={
@@ -1167,6 +1177,7 @@ async def create_pedido(
         fecha_entrega=date.today() + timedelta(days=cliente.dias_entrega or 1),
         # Si no se eligió transporte, se propone el último que usó el cliente.
         transporte=body.transporte or cliente.transporte_habitual,
+        modalidad_entrega=body.modalidad_entrega or _modalidad_por_defecto(cliente),
         fecha_compromiso_pago=body.fecha_compromiso_pago,
         sociedad=body.sociedad,
         observacion=body.observacion,
@@ -1358,6 +1369,11 @@ async def update_pedido(
 
     # La dirección de entrega se resuelve aparte: elegir una de la libreta tiene
     # que arrastrar el texto y las coordenadas, no solo el id.
+    # `modalidad_entrega` no es nullable: un cliente que mande null explícito
+    # reventaría en el commit con un error de base en vez de un 422.
+    if "modalidad_entrega" in update_data and update_data["modalidad_entrega"] is None:
+        update_data.pop("modalidad_entrega")
+
     envio_tocado = "direccion_entrega_id" in update_data or "direccion_entrega" in update_data
     update_data.pop("direccion_entrega_id", None)
     update_data.pop("direccion_entrega", None)
@@ -1909,6 +1925,11 @@ async def get_pedido_pdf(
         "shipping_status": pedido.shipping_status.value,
         "payment_status": pedido.payment_status.value,
         "transporte": pedido.transporte,
+        "modalidad_entrega": pedido.modalidad_entrega,
+        # La dirección del pedido, no la fiscal del cliente: mismo fallback que
+        # `_build_pedido_response`.
+        "direccion_entrega": pedido.direccion_entrega or (pedido.cliente.domicilio if pedido.cliente else ""),
+        "bultos": pedido.bultos or 0,
         "sociedad": pedido.sociedad,
         "depositos": _depositos_de(pedido),
         "importe_total": 0.0 if sin_valores else float(pedido.importe_total),
@@ -1942,18 +1963,26 @@ async def get_pedido_pdf(
             "unidad_label": item.unidad_label,
             "precio_unitario": 0.0 if sin_valores else float(item.precio_unitario),
             "precio_total": 0.0 if sin_valores else float(item.precio_total),
-            "descuento_porcentaje": float(item.descuento_porcentaje) if item.descuento_porcentaje else None,
+            # El descuento también es dato comercial: en la copia sin valores va
+            # afuera. Si no, el remito de depósito mostraba "15,0%" al lado de
+            # precios en cero, que es justo lo que el tilde viene a ocultar.
+            "descuento_porcentaje": (
+                None
+                if sin_valores or not item.descuento_porcentaje
+                else float(item.descuento_porcentaje)
+            ),
         }
         for item in pedido.items
     ]
 
-    filename = generate_pedido_pdf(pedido_data, cliente_data, vendedor_nombre, items)
+    filename = generate_pedido_pdf(pedido_data, cliente_data, vendedor_nombre, items, sin_valores=sin_valores)
     full_path = os.path.join(settings.PDF_STORAGE_PATH, filename)
 
     return FileResponse(
         path=full_path,
         media_type="application/pdf",
-        filename=filename,
+        # El sufijo del archivo es interno: la descarga conserva el número limpio.
+        filename=f"{pedido.numero_pedido}.pdf",
     )
 
 

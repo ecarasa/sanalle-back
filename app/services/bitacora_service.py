@@ -30,6 +30,7 @@ CAMPOS_PEDIDO_AUDITADOS: tuple[str, ...] = (
     "fecha_entrega",
     "fecha_compromiso_pago",
     "transporte",
+    "modalidad_entrega",
     "vendedor_id",
     "repartidor_id",
     "tipo_precio",
