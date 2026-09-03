@@ -15,7 +15,7 @@ from app.models.user import User
 from app.models.movimiento_stock import MovimientoStock
 from app.models.deposito import Deposito
 from app.models.stock_producto_deposito import StockProductoDeposito
-from app.services import ajuste_stock_service, stock_service
+from app.services import ajuste_stock_service, bitacora_producto_service, stock_service
 from app.schemas.producto import (
     ProductoCreate, ProductoUpdate, ProductoResponse, ProductoPublicResponse,
     PreciosBulkUpdate, PreciosPorcentajeUpdate
@@ -533,7 +533,7 @@ async def get_producto(
 async def create_producto(
     body: ProductoCreate,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+    current_user: User = Depends(require_role(["admin", "super_admin"])),
 ):
     existing = await db.execute(
         select(Producto).where(Producto.codigo == body.codigo)
@@ -550,6 +550,7 @@ async def create_producto(
     producto = Producto(**data)
     db.add(producto)
     await db.flush()
+    bitacora_producto_service.registrar_alta(db, producto=producto, usuario=current_user)
     result = await db.execute(
         select(Producto).where(Producto.id == producto.id)
         .options(selectinload(Producto.proveedor))
@@ -564,7 +565,7 @@ async def update_producto(
     id: int,
     body: ProductoUpdate,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+    current_user: User = Depends(require_role(["admin", "super_admin"])),
 ):
     result = await db.execute(select(Producto).where(Producto.id == id))
     producto = result.scalar_one_or_none()
@@ -574,6 +575,8 @@ async def update_producto(
             detail="Producto no encontrado",
         )
 
+    # Foto antes de tocar nada: el diff se arma comparando contra esto.
+    antes = bitacora_producto_service.snapshot(producto)
     update_data = body.model_dump(exclude_unset=True)
 
     # Los precios de venta son derivados: se recalculan desde pvp + costo% + márgenes.
@@ -602,6 +605,9 @@ async def update_producto(
         setattr(producto, field, value)
 
     await db.flush()
+    bitacora_producto_service.registrar_cambios(
+        db, producto=producto, antes=antes, usuario=current_user, origen="ficha"
+    )
     result2 = await db.execute(
         select(Producto).where(Producto.id == id)
         .options(selectinload(Producto.proveedor))
@@ -615,14 +621,18 @@ async def update_producto(
 async def actualizar_precios_bulk(
     body: PreciosBulkUpdate,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+    current_user: User = Depends(require_role(["admin", "super_admin"])),
 ):
     """Bulk update prices for multiple products."""
     updated = 0
+    # Un solo grupo: los N productos de esta edición quedan agrupados como un
+    # único cambio, y no como N cambios sueltos sin relación entre sí.
+    grupo = bitacora_producto_service.nuevo_grupo_id()
     for item in body.items:
         result = await db.execute(select(Producto).where(Producto.id == item.producto_id))
         producto = result.scalar_one_or_none()
         if producto:
+            antes = bitacora_producto_service.snapshot(producto)
             if item.pvp is not None:
                 producto.pvp = item.pvp
             for lista in LISTAS:
@@ -631,6 +641,11 @@ async def actualizar_precios_bulk(
                     setattr(producto, lista.precio_field, valor)
             if item.costo_mas_iibb is not None:
                 producto.costo_mas_iibb = item.costo_mas_iibb
+            bitacora_producto_service.registrar_cambios(
+                db, producto=producto, antes=antes, usuario=current_user,
+                origen="precios_masivo", observacion="Edición masiva de precios",
+                grupo_id=grupo,
+            )
             updated += 1
 
     await db.commit()
@@ -641,7 +656,7 @@ async def actualizar_precios_bulk(
 async def actualizar_precios_porcentaje(
     body: PreciosPorcentajeUpdate,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+    current_user: User = Depends(require_role(["admin", "super_admin"])),
 ):
     """
     Apply a percentage update to pvp (multiplicative) or margins/costs (additive).
@@ -675,7 +690,12 @@ async def actualizar_precios_porcentaje(
     factor_mult = Decimal(1) + (porc_decimal / Decimal(100))
 
     actualizados = 0
+    grupo = bitacora_producto_service.nuevo_grupo_id()
+    detalle = f"{body.porcentaje:+g}% sobre {body.campo}"
+    if body.filtro and f_id:
+        detalle += f" ({body.filtro} {f_id})"
     for p in productos:
+        antes = bitacora_producto_service.snapshot(p)
         # A. Aplicar el cambio sobre el campo destino
         if body.campo == "pvp":
             if not p.pvp:
@@ -691,6 +711,10 @@ async def actualizar_precios_porcentaje(
 
         # B. Recalcular costos y precios derivados
         aplicar_a_producto(p)
+        bitacora_producto_service.registrar_cambios(
+            db, producto=p, antes=antes, usuario=current_user,
+            origen="precios_masivo", observacion=detalle, grupo_id=grupo,
+        )
         actualizados += 1
 
     await db.commit()
@@ -879,7 +903,7 @@ async def operacion_stock(
 async def delete_producto(
     id: int,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+    current_user: User = Depends(require_role(["admin", "super_admin"])),
 ):
     result = await db.execute(select(Producto).where(Producto.id == id))
     producto = result.scalar_one_or_none()
@@ -891,6 +915,7 @@ async def delete_producto(
 
     producto.status = "inactivo"
     producto.activo = False
+    bitacora_producto_service.registrar_baja(db, producto=producto, usuario=current_user)
     await db.commit()
     return {"message": f"Producto {producto.nombre} desactivado"}
 
@@ -1037,6 +1062,7 @@ async def import_productos_excel(
     updated = 0
     skipped = 0
     errors: list[str] = []
+    grupo_import = bitacora_producto_service.nuevo_grupo_id()
 
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
         if not row or all(v is None or v == "" for v in row):
@@ -1139,10 +1165,16 @@ async def import_productos_excel(
             result = await db.execute(select(Producto).where(Producto.codigo == codigo))
             existing = result.scalar_one_or_none()
             if existing:
+                antes = bitacora_producto_service.snapshot(existing)
                 for field, value in mapped.items():
                     setattr(existing, field, value)
                 # Sin esto, importar márgenes dejaba los precios de venta sin recalcular.
                 aplicar_a_producto(existing)
+                bitacora_producto_service.registrar_cambios(
+                    db, producto=existing, antes=antes, usuario=_current_user,
+                    origen="import", observacion=f"Planilla: {file.filename or 'sin nombre'}",
+                    grupo_id=grupo_import,
+                )
                 producto_fila = existing
                 updated += 1
             else:
@@ -1151,6 +1183,10 @@ async def import_productos_excel(
                 db.add(nuevo)
                 # El producto nuevo necesita id antes de poder colgarle stock.
                 await db.flush()
+                bitacora_producto_service.registrar_alta(
+                    db, producto=nuevo, usuario=_current_user, origen="import",
+                    observacion=f"Planilla: {file.filename or 'sin nombre'}",
+                )
                 producto_fila = nuevo
                 created += 1
 

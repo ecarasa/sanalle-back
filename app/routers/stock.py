@@ -10,10 +10,11 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.models.bitacora_producto import BitacoraProducto
 from app.models.deposito import Deposito
 from app.models.producto import Producto
 from app.models.user import User
@@ -30,7 +31,12 @@ from app.schemas.stock import (
     TomaConteoRequest,
     TomaInventarioCreate,
 )
-from app.services import ajuste_stock_service, stock_service, toma_inventario_service
+from app.services import (
+    ajuste_stock_service,
+    bitacora_producto_service,
+    stock_service,
+    toma_inventario_service,
+)
 from app.utils.deps import (
     ROLES_MAESTRO_PRODUCTOS,
     ROLES_STOCK,
@@ -93,20 +99,25 @@ async def crear_ajuste(
 async def actualizar_minimos_bulk(
     body: MinimosBulkRequest,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
+    current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
 ):
     """Fija el mínimo de una lista de productos (edición inline de la grilla)."""
     actualizados = 0
+    grupo = bitacora_producto_service.nuevo_grupo_id()
     for item in body.items:
-        res = await db.execute(
-            update(Producto)
-            .where(Producto.id == item.producto_id)
-            .values(
-                stock_minimo_cajas=item.stock_minimo_cajas,
-                stock_minimo_blisters=item.stock_minimo_blisters,
-            )
+        producto = (
+            await db.execute(select(Producto).where(Producto.id == item.producto_id))
+        ).scalar_one_or_none()
+        if producto is None:
+            continue
+        antes = bitacora_producto_service.snapshot(producto)
+        producto.stock_minimo_cajas = item.stock_minimo_cajas
+        producto.stock_minimo_blisters = item.stock_minimo_blisters
+        bitacora_producto_service.registrar_cambios(
+            db, producto=producto, antes=antes, usuario=current_user, origen="minimos",
+            grupo_id=grupo,
         )
-        actualizados += res.rowcount or 0
+        actualizados += 1
     await db.commit()
     return {"updated": actualizados}
 
@@ -115,7 +126,7 @@ async def actualizar_minimos_bulk(
 async def actualizar_minimos_masivo(
     body: MinimosMasivoRequest,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
+    current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
 ):
     """Pone el mismo mínimo a todo un laboratorio, proveedor o categoría."""
     filtros = [Producto.activo.is_(True)]
@@ -135,16 +146,22 @@ async def actualizar_minimos_masivo(
             )
         )
 
-    res = await db.execute(
-        update(Producto)
-        .where(and_(*filtros))
-        .values(
-            stock_minimo_cajas=body.valor_cajas,
-            stock_minimo_blisters=body.valor_blisters,
+    # Se recorren uno por uno en vez de un UPDATE en bloque: sin leer el valor
+    # anterior no hay bitácora posible, y un cambio de mínimo a todo un
+    # laboratorio es justo de los que después hay que poder explicar.
+    productos = (await db.execute(select(Producto).where(and_(*filtros)))).scalars().all()
+    grupo = bitacora_producto_service.nuevo_grupo_id()
+    detalle = f"Mínimo masivo: {body.valor_cajas} caja(s)"
+    for producto in productos:
+        antes = bitacora_producto_service.snapshot(producto)
+        producto.stock_minimo_cajas = body.valor_cajas
+        producto.stock_minimo_blisters = body.valor_blisters
+        bitacora_producto_service.registrar_cambios(
+            db, producto=producto, antes=antes, usuario=current_user,
+            origen="minimos", observacion=detalle, grupo_id=grupo,
         )
-    )
     await db.commit()
-    return {"updated": res.rowcount or 0}
+    return {"updated": len(productos)}
 
 
 # --- Toma de inventario -------------------------------------------------------
@@ -555,7 +572,7 @@ async def minimos_excel(
 async def importar_minimos_excel(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
+    current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
 ):
     if not file.filename or not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="El archivo debe ser XLSX")
@@ -577,6 +594,7 @@ async def importar_minimos_excel(
 
     actualizados = 0
     errores: list[str] = []
+    grupo = bitacora_producto_service.nuevo_grupo_id()
     for nro, fila in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
         if not fila or all(v is None or v == "" for v in fila):
             continue
@@ -593,12 +611,103 @@ async def importar_minimos_excel(
         except (ValueError, TypeError):
             errores.append(f"Fila {nro}: los mínimos tienen que ser enteros >= 0")
             continue
-        res = await db.execute(
-            update(Producto)
-            .where(Producto.id == producto_id)
-            .values(stock_minimo_cajas=cajas, stock_minimo_blisters=blisters)
+        producto = (
+            await db.execute(select(Producto).where(Producto.id == producto_id))
+        ).scalar_one_or_none()
+        if producto is None:
+            continue
+        antes = bitacora_producto_service.snapshot(producto)
+        producto.stock_minimo_cajas = cajas
+        producto.stock_minimo_blisters = blisters
+        bitacora_producto_service.registrar_cambios(
+            db, producto=producto, antes=antes, usuario=current_user, origen="minimos",
+            observacion=f"Planilla: {file.filename or 'sin nombre'}", grupo_id=grupo,
         )
-        actualizados += res.rowcount or 0
+        actualizados += 1
 
     await db.commit()
     return {"updated": actualizados, "errors": errores[:20], "total_errores": len(errores)}
+
+
+# --- Bitácora de la ficha del producto ----------------------------------------
+# Vive en el router de stock y no en el de productos por una razón práctica:
+# `/productos/{id}` se come cualquier path nuevo declarado después, y acá la
+# pantalla que lo consume es la solapa de Stock.
+
+
+@router.get("/cambios-producto")
+async def list_cambios_producto(
+    search: str = Query("", description="Busca por producto, código o usuario"),
+    producto_id: int | None = Query(None),
+    usuario_id: int | None = Query(None),
+    campo: str | None = Query(None),
+    origen: str | None = Query(None, description="ficha | minimos | precios_masivo | import"),
+    accion: str | None = Query(None, description="alta | modificacion | baja"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    """Quién cambió qué en la ficha de un producto. Las cantidades van aparte,
+    en `/movimientos-stock`: son dos preguntas distintas."""
+    query = select(BitacoraProducto).order_by(BitacoraProducto.id.desc())
+    if search:
+        patron = f"%{search}%"
+        query = query.where(
+            or_(
+                BitacoraProducto.producto_nombre.ilike(patron),
+                BitacoraProducto.producto_codigo.ilike(patron),
+                BitacoraProducto.usuario_nombre.ilike(patron),
+            )
+        )
+    if producto_id:
+        query = query.where(BitacoraProducto.producto_id == producto_id)
+    if usuario_id:
+        query = query.where(BitacoraProducto.usuario_id == usuario_id)
+    if campo:
+        query = query.where(BitacoraProducto.campo == campo)
+    if origen:
+        query = query.where(BitacoraProducto.origen == origen)
+    if accion:
+        query = query.where(BitacoraProducto.accion == accion)
+
+    total = (
+        await db.execute(select(func.count()).select_from(query.subquery()))
+    ).scalar_one()
+    filas = (
+        await db.execute(query.offset((page - 1) * page_size).limit(page_size))
+    ).scalars().all()
+
+    return {
+        "items": [
+            {
+                "id": f.id,
+                "producto_id": f.producto_id,
+                "producto_codigo": f.producto_codigo,
+                "producto_nombre": f.producto_nombre,
+                "usuario_nombre": f.usuario_nombre or "Sistema",
+                "accion": f.accion,
+                "origen": f.origen,
+                "campo": f.campo,
+                "campo_label": bitacora_producto_service.ETIQUETAS.get(f.campo or "", f.campo),
+                "valor_anterior": f.valor_anterior,
+                "valor_nuevo": f.valor_nuevo,
+                "grupo_id": f.grupo_id,
+                "observacion": f.observacion,
+                "created_at": f.created_at,
+            }
+            for f in filas
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get("/cambios-producto/campos")
+async def list_campos_auditados(_current_user: User = Depends(get_current_user)):
+    """Los campos que se auditan, con su etiqueta, para armar el filtro."""
+    return [
+        {"campo": c, "label": bitacora_producto_service.ETIQUETAS.get(c, c)}
+        for c in bitacora_producto_service.CAMPOS_AUDITADOS
+    ]
