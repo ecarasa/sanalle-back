@@ -3,13 +3,16 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    POSTGRES_USER: str = "sanalle_user"
-    POSTGRES_PASSWORD: str = "sanalle_pass_2024"
+    # Sin valor por default a propósito: cada ambiente TIENE que setear estos por
+    # env. Antes tenían un valor real como fallback, y ese valor terminó público
+    # en el repo — quien lo leyera podía forjar tokens o conectarse a la base.
+    POSTGRES_USER: str = ""
+    POSTGRES_PASSWORD: str = ""
     POSTGRES_DB: str = "sanalle_db"
     POSTGRES_HOST: str = "db"
     POSTGRES_PORT: int = 5432
-    DATABASE_URL: str = "postgresql+asyncpg://sanalle_user:sanalle_pass_2024@db:5432/sanalle_db"
-    SECRET_KEY: str = "sanalle-super-secret-jwt-key-2024-drogueria"
+    DATABASE_URL: str = ""
+    SECRET_KEY: str = ""
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
@@ -17,7 +20,7 @@ class Settings(BaseSettings):
     PDF_STORAGE_PATH: str = "/app/storage/recibos"
     ADMIN_EMAIL: str = "admin@sanalle.com"
     ADMIN_USERNAME: str = "admin"
-    ADMIN_PASSWORD: str = "admin123"
+    ADMIN_PASSWORD: str = ""
     ADMIN_NOMBRE: str = "Administrador SANALLE"
     TOMTOM_API_KEY: str = "[ENCRYPTION_KEY]"
     AWS_ACCESS_KEY_ID: str = "TEST_ACCESS_KEY"
@@ -38,6 +41,28 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
 
+    # Valores que estuvieron hardcodeados en el repo público: si algún ambiente
+    # todavía los usa, el token o la base están comprometidos. Se rechazan.
+    _SECRETOS_QUEMADOS = frozenset({
+        "sanalle-super-secret-jwt-key-2024-drogueria",
+        "sanalle_pass_2024",
+        "admin123",
+    })
+
+    @model_validator(mode="after")
+    def _exigir_secretos(self):
+        if not self.SECRET_KEY:
+            raise ValueError(
+                "SECRET_KEY no está seteada. Definí una clave propia por variable "
+                "de entorno (ej. `openssl rand -hex 32`)."
+            )
+        if self.SECRET_KEY in self._SECRETOS_QUEMADOS:
+            raise ValueError(
+                "SECRET_KEY es un valor que quedó público en el repo. Generá una "
+                "nueva (`openssl rand -hex 32`) y seteala por env."
+            )
+        return self
+
     @model_validator(mode="after")
     def _resolve_app_name(self):
         if self.NEXT_PUBLIC_APP_NAME:
@@ -49,7 +74,13 @@ class Settings(BaseSettings):
         # Railway (y varios PaaS) entregan la URL como `postgres://` o
         # `postgresql://`, pero la app usa el driver async (asyncpg).
         # Normalizamos para poder pegar la DATABASE_URL de Railway tal cual.
+        # Si viene vacía, se arma desde las partes POSTGRES_* del entorno.
         url = self.DATABASE_URL
+        if not url and self.POSTGRES_USER and self.POSTGRES_PASSWORD:
+            url = (
+                f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+                f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+            )
         if url.startswith("postgres://"):
             url = "postgresql://" + url[len("postgres://"):]
         if url.startswith("postgresql://"):

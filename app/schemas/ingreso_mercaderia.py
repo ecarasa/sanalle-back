@@ -82,6 +82,8 @@ class IngresoMercaderiaResponse(IngresoMercaderiaBase):
     imputaciones: list[IngresoImputacionResponse] = []
     created_at: datetime
     updated_at: datetime
-    archivo_url: Optional[str] = None
+    # Antes era la URL pública del archivo. Ahora el objeto es privado:
+    # sólo se informa si hay adjunto; el link se pide a GET /{id}/archivo.
+    tiene_archivo: bool = False
 
     model_config = {"from_attributes": True}

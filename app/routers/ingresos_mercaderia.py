@@ -25,7 +25,7 @@ from app.schemas.ingreso_mercaderia import (
     IngresoMercaderiaItemResponse,
 )
 from app.services.pdf_service import generate_orden_compra_pdf
-from app.services.s3_service import upload_ingreso_archivo, delete_s3_file
+from app.services.s3_service import upload_ingreso_archivo, delete_s3_file, url_prefirmada, key_de
 from app.utils.deps import get_current_user, require_role
 
 router = APIRouter()
@@ -87,7 +87,7 @@ def _build_response(ingreso: IngresoMercaderia) -> IngresoMercaderiaResponse:
         dias_plazo=ingreso.dias_plazo,
         created_at=ingreso.created_at,
         updated_at=ingreso.updated_at,
-        archivo_url=ingreso.archivo_url,
+        tiene_archivo=bool(ingreso.archivo_url),
     )
 
 
@@ -414,7 +414,7 @@ async def upload_archivo(
     ingreso = await _load_ingreso(id, db)
     content = await file.read()
     proveedor_nombre = ingreso.proveedor.nombre if ingreso.proveedor else ""
-    _, url = await asyncio.to_thread(
+    key = await asyncio.to_thread(
         upload_ingreso_archivo,
         content,
         file.content_type,
@@ -422,10 +422,26 @@ async def upload_archivo(
         ingreso.numero,
         file.filename or "factura.pdf",
     )
-    ingreso.archivo_url = url
+    # Se guarda la key del objeto privado, no una URL pública. El link de
+    # descarga se pide aparte y es temporal.
+    ingreso.archivo_url = key
     await db.commit()
     ingreso = await _load_ingreso(id, db)
     return _build_response(ingreso)
+
+
+@router.get("/{id}/archivo")
+async def get_archivo(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    """Devuelve un link de descarga temporal de la factura adjunta."""
+    ingreso = await _load_ingreso(id, db)
+    if not ingreso.archivo_url:
+        raise HTTPException(status_code=404, detail="No hay archivo adjunto")
+    url = await asyncio.to_thread(url_prefirmada, key_de(ingreso.archivo_url))
+    return {"url": url}
 
 
 @router.delete("/{id}/archivo")
@@ -438,8 +454,7 @@ async def delete_archivo(
     if not ingreso.archivo_url:
         raise HTTPException(status_code=404, detail="No hay archivo adjunto")
 
-    key = ingreso.archivo_url.replace(f"{settings.S3_URL}/", "")
-    await asyncio.to_thread(delete_s3_file, key)
+    await asyncio.to_thread(delete_s3_file, key_de(ingreso.archivo_url))
     ingreso.archivo_url = None
     await db.commit()
     ingreso = await _load_ingreso(id, db)
