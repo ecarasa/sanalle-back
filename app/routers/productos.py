@@ -65,13 +65,6 @@ def _stocks_por_deposito(p: Producto) -> list[dict]:
     return rows
 
 
-# Total de cajas del producto, para ordenar y filtrar la grilla. Sale de la misma
-# expresión que muestra la columna (`stock_service`), normalizando los blísters
-# sueltos a cajas: si no, la grilla mostraba 1050 y filtrar por 1050 no traía
-# nada porque el filtro sumaba sólo la columna `cajas`.
-_STOCK_TOTAL_CAJAS = stock_service.SQL_TOTAL_BLISTERS / stock_service.SQL_POR_CAJA
-
-
 def _producto_to_response(p: Producto) -> dict:
     """Build response dict with relationship names and computed fields."""
     d = ProductoResponse.model_validate(p).model_dump()
@@ -166,7 +159,7 @@ async def list_productos(
         },
         extra_mappings={
             "laboratorio_nombre": Laboratorio.nombre,
-            "stock_total_cajas": _STOCK_TOTAL_CAJAS,
+            "stock_total_cajas": stock_service.SQL_TOTAL_CAJAS,
         },
     )
 
@@ -196,7 +189,11 @@ async def list_productos(
         "presentacion": Producto.presentacion,
         "categoria_producto": Producto.categoria_producto,
         "status": Producto.status,
-        "stock_total_cajas": _STOCK_TOTAL_CAJAS,
+        "stock_total_cajas": stock_service.SQL_TOTAL_CAJAS,
+        # Clave propia y NO mapeada a "laboratorio_nombre": si el encabezado
+        # "Laboratorio" ordenara por este número invisible, nadie entendería el
+        # resultado. Esta es para pedir explícitamente el orden de la lista.
+        "laboratorio_orden": Laboratorio.orden,
         # Ordena por criticidad: primero lo que hay que reponer.
         "semaforo_stock": case(
             (stock_service.SQL_SEMAFORO_STOCK == "rojo", 0),
@@ -287,14 +284,18 @@ async def build_public_catalogo(
     total_result = await db.execute(count_query)
     total = total_result.scalar_one()
 
-    # Orden: laboratorio (nulls al final) y luego nombre
-    lab_order = func.coalesce(Laboratorio.nombre, "￿")
+    # Orden de la lista de precios: primero el orden que fija la droguería, después
+    # el nombre del laboratorio (para los que comparten posición) y por último el
+    # producto. El `coalesce(orden, 999999)` manda los productos sin laboratorio al
+    # final, que es lo que antes hacía el centinela "￿".
+    lab_orden = func.coalesce(Laboratorio.orden, 999999)
+    lab_nombre = func.lower(func.coalesce(Laboratorio.nombre, "￿"))
     query = (
         select(Producto)
         .outerjoin(Laboratorio, Producto.laboratorio_id == Laboratorio.id)
         .options(selectinload(Producto.laboratorio))
         .where(where_clause)
-        .order_by(func.lower(lab_order), func.lower(Producto.nombre))
+        .order_by(lab_orden, lab_nombre, func.lower(Producto.nombre))
     )
     if not all:
         query = query.offset((page - 1) * page_size).limit(page_size)

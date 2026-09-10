@@ -29,9 +29,11 @@ from app.models.pedido_item import PedidoItem
 from app.models.pedido_plan_pago import PedidoPlanPago
 from app.models.producto import Producto
 from app.models.pago_imputacion import PagoImputacion
+from app.models.stock_producto_deposito import StockProductoDeposito
 from app.models.user import User
 from app.models.rutas import Ruta
 from app.schemas.pedido import (
+    AvisoStock,
     PedidoCreate,
     PedidoUpdate,
     PedidoLogisticaUpdate,
@@ -61,6 +63,7 @@ from app.services.bitacora_service import (
 )
 from app.services.pdf_service import generate_pedido_pdf, generate_hoja_ruta_pdf
 from app.services.pago_service import imputar_pagos_a_pedido
+from app.services import pricing_service
 from app.services.pricing_service import LISTAS
 from app.services import stock_service
 from app.services.semaforo_service import calcular_semaforo_pedido
@@ -132,19 +135,59 @@ ROLES_PUEDEN_REABRIR = ("operaciones", "admin", "super_admin")
 # `borrador -> pendiente` no figura en su juego de ROLE_SHIPPING_ALLOWED.
 ESTADOS_EDITABLES = (EstadoDespacho.borrador, EstadoDespacho.pendiente)
 
+# Estados que NO comprometen mercadería. Un `borrador` es una cotización: se
+# puede armar por más de lo que hay (avisando), y recién al confirmarla se
+# reserva. `cancelado` ya soltó lo suyo. Es el mismo conjunto que no computa
+# para deuda ni dashboard, así que se reusa en vez de mantener dos listas que
+# el día que diverjan nadie va a notar.
+ESTADOS_SIN_RESERVA = ESTADOS_NO_COMPUTABLES
+
+
+def _debe_reservar(pedido: Pedido) -> bool:
+    """Si este pedido, tal como está ahora, tiene que tener stock comprometido.
+
+    Depende del estado y no del momento de creación: el mismo pedido no reserva
+    mientras es borrador y sí reserva apenas pasa a `pendiente`.
+    """
+    return pedido.reserva_stock and pedido.shipping_status not in ESTADOS_SIN_RESERVA
+
+
+# Lo que ve depósito por defecto. `pendiente` entra porque la fecha de entrega se
+# planifica ANTES de tomar el pedido, y `listo_para_despacho` porque hasta que sale
+# todavía se corrige. Verlos sólo en `en_preparacion` era la razón por la que
+# depósito "no podía" cargar la fecha: el pedido no aparecía en la pantalla.
+ESTADOS_PREPARACION_DEFAULT = "pendiente,en_preparacion,listo_para_despacho"
+
 
 @router.get("/preparacion")
 async def list_preparacion(
     search: str = Query("", description="Buscar por numero_pedido o nombre de cliente"),
+    estados: str = Query(
+        ESTADOS_PREPARACION_DEFAULT,
+        description="Estados de despacho separados por coma.",
+    ),
     db: AsyncSession = Depends(get_db),
     _current_user: User = Depends(require_role(["operaciones", "admin", "super_admin"])),
 ):
-    """Cola de armado para el rol OPERACIONES: pedidos en `en_preparacion` con su
-    detalle de mercadería, SIN ningún campo de dinero (precios/importes)."""
+    """Cola de armado para el rol OPERACIONES: pedidos con su detalle de
+    mercadería, SIN ningún campo de dinero (precios/importes)."""
+    # Un typo en `estados` se rechaza en vez de ignorarse: si no, la cola saldría
+    # más ancha o más angosta de lo que el que llama cree. Mismo criterio que en
+    # `list_pedidos`.
+    try:
+        estados_enum = [EstadoDespacho(e.strip()) for e in estados.split(",") if e.strip()]
+    except ValueError as err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"estados inválido: {err}. Válidos: {[e.value for e in EstadoDespacho]}",
+        )
+    if not estados_enum:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Indicá al menos un estado.")
+
     q = (
         select(Pedido)
         .join(Cliente, Pedido.cliente_id == Cliente.id)
-        .where(Pedido.shipping_status == EstadoDespacho.en_preparacion)
+        .where(Pedido.shipping_status.in_(estados_enum))
         .options(
             selectinload(Pedido.cliente),
             selectinload(Pedido.items).selectinload(PedidoItem.producto),
@@ -166,6 +209,13 @@ async def list_preparacion(
             "fecha": p.fecha.isoformat() if p.fecha else None,
             "fecha_entrega": p.fecha_entrega.isoformat() if p.fecha_entrega else None,
             "bultos": p.bultos or 0,
+            # Estado y logística: ya vienen cargados, no cuestan queries, y depósito
+            # necesita saber en qué etapa está cada pedido y cómo se entrega.
+            "shipping_status": p.shipping_status.value,
+            "tipo_documento": p.tipo_documento.value if p.tipo_documento else None,
+            "modalidad_entrega": p.modalidad_entrega,
+            "transporte": p.transporte,
+            "direccion_entrega": p.direccion_entrega or (p.cliente.domicilio if p.cliente else None),
             # Depósito tiene que saber que esa mercadería puede no estar todavía
             # en la góndola: el pedido se cargó sin comprometer stock.
             "reserva_stock": p.reserva_stock,
@@ -236,17 +286,18 @@ async def _mover_reservas_pedido(db: AsyncSession, pedido: Pedido, *, devolver: 
     """Cierra las reservas de todas las líneas del pedido.
 
     `devolver=False` es la entrega: la mercadería salió, la reserva se consume y
-    el stock físico (que ya bajó al crear el pedido) no vuelve.
+    el stock físico (que bajó al confirmar el pedido) no vuelve.
     `devolver=True` es cancelar o borrar: la reserva vuelve a ser stock vendible
     en el depósito del que había salido cada línea.
 
     Las líneas sin depósito son pedidos viejos anteriores a esta función; se saltean
     en vez de adivinar un depósito y descuadrar el stock de uno que no corresponde.
 
-    Un pedido con `reserva_stock` apagado nunca reservó nada, así que no hay qué
-    consumir ni qué devolver: tocarlo inventaría mercadería.
+    Un pedido que hoy no tiene reserva vigente —el tilde apagado, o todavía es un
+    borrador— no tiene nada que consumir ni que devolver: tocarlo inventaría
+    mercadería. Ojo con el orden: esto se lee ANTES de asignar el estado nuevo.
     """
-    if not pedido.reserva_stock:
+    if not _debe_reservar(pedido):
         return
 
     for item in pedido.items:
@@ -432,7 +483,110 @@ def _depositos_de(pedido: Pedido) -> list[str]:
     return nombres
 
 
-def _build_pedido_response(pedido: Pedido) -> PedidoResponse:
+# Un centavo de diferencia es redondeo, no una excepción comercial. El front
+# calcula en float y el backend en Decimal: sin tolerancia, media grilla saldría
+# marcada por el último decimal.
+TOLERANCIA_EXCEPCION = Decimal("0.01")
+
+
+def _desvio_de_lista(
+    producto: Producto, precio_unitario, unidad_venta: str, grupo: str | None
+) -> str | None:
+    """Describe el desvío de una línea contra su precio de lista, o None si no hay.
+
+    Se recalcula el precio esperado en el servidor a propósito: el cliente manda
+    `precio_lista` por su cuenta y, cuando el vendedor pisa el precio a mano, el
+    form conserva el viejo como referencia. Comparar contra ese valor no
+    detectaría nada.
+
+    Un producto sin precio en esa lista no es una excepción: es un producto que no
+    se vende ahí, y eso ya lo frena el form.
+    """
+    esperado = pricing_service.precio_esperado(producto, grupo or "minorista", unidad_venta)
+    if esperado is None:
+        return None
+    real = Decimal(str(precio_unitario))
+    if abs(real - esperado) <= TOLERANCIA_EXCEPCION:
+        return None
+    signo = "+" if real > esperado else "-"
+    pct = (abs(real - esperado) / esperado * 100) if esperado else Decimal("0")
+    return (
+        f"{producto.nombre}: ${real:.2f} vs lista ${esperado:.2f} "
+        f"({signo}{pct.quantize(Decimal('0.1'))}%)"
+    )
+
+
+def _aplicar_excepciones(pedido: Pedido, desvios: list[str]) -> None:
+    """Deja en el pedido el resumen de los desvíos detectados al guardar."""
+    pedido.tiene_excepcion_precio = bool(desvios)
+    # Se cortan en 5: es un resumen para el badge y el tooltip del listado, no la
+    # auditoría. El detalle por línea ya está en `pedido_items`.
+    pedido.excepcion_precio_detalle = " · ".join(desvios[:5]) if desvios else None
+
+
+async def _avisos_stock(db: AsyncSession, pedido: Pedido) -> list[AvisoStock]:
+    """Líneas de una cotización que piden más de lo disponible.
+
+    Sólo tiene sentido en `borrador`: en cualquier otro estado el pedido ya tiene
+    su reserva hecha y por definición le alcanzaba. Va en una sola query contra
+    `stock_producto_deposito` —no una por línea— y usa el mismo formateo que
+    `StockInsuficiente`, así el aviso de la cotización y el error al confirmarla
+    dicen exactamente lo mismo.
+    """
+    # `reserva_stock` apagado = el pedido nunca va a comprometer nada, así que no
+    # hay faltante del que avisar.
+    if not pedido.reserva_stock or pedido.shipping_status != EstadoDespacho.borrador:
+        return []
+
+    lineas = [i for i in pedido.items if i.deposito_id and i.producto]
+    if not lineas:
+        return []
+
+    filas = (
+        await db.execute(
+            select(StockProductoDeposito).where(
+                StockProductoDeposito.producto_id.in_({i.producto_id for i in lineas}),
+                StockProductoDeposito.deposito_id.in_({i.deposito_id for i in lineas}),
+            )
+        )
+    ).scalars().all()
+    disponible_por_clave = {(f.producto_id, f.deposito_id): f for f in filas}
+
+    # Dos líneas del mismo producto y depósito compiten por el mismo stock; se
+    # acumulan para no avisar de a una como si cada una tuviera todo disponible.
+    pedido_por_clave: dict[tuple[int, int], int] = defaultdict(int)
+    for item in lineas:
+        pedido_por_clave[(item.producto_id, item.deposito_id)] += stock_service.a_blisters(
+            item.producto, item.cantidad_cajas, item.cantidad_blisters
+        )
+
+    avisos: list[AvisoStock] = []
+    for item in lineas:
+        clave = (item.producto_id, item.deposito_id)
+        if clave not in pedido_por_clave:
+            continue  # ya avisado por otra línea del mismo producto/depósito
+        pedidos_bl = pedido_por_clave.pop(clave)
+        por_caja = item.producto.get_blisters_por_caja
+        fila = disponible_por_clave.get(clave)
+        disponible_bl = fila.total_blisters(por_caja) if fila else 0
+        if pedidos_bl <= disponible_bl:
+            continue
+        avisos.append(
+            AvisoStock(
+                producto_id=item.producto_id,
+                producto_nombre=item.producto.nombre,
+                deposito_id=item.deposito_id,
+                deposito_nombre=item.deposito.nombre if item.deposito else None,
+                pedido=stock_service.formato_cantidad(pedidos_bl, por_caja),
+                disponible=stock_service.formato_cantidad(disponible_bl, por_caja),
+            )
+        )
+    return avisos
+
+
+def _build_pedido_response(
+    pedido: Pedido, avisos: list[AvisoStock] | None = None
+) -> PedidoResponse:
     """Build a PedidoResponse from a Pedido ORM instance with loaded relationships."""
     items = [_build_item_response(item) for item in pedido.items]
 
@@ -465,6 +619,10 @@ def _build_pedido_response(pedido: Pedido) -> PedidoResponse:
         sociedad=pedido.sociedad,
         depositos=_depositos_de(pedido),
         tipo_precio=pedido.tipo_precio,
+        tipo_cliente=pedido.tipo_cliente,
+        aplica_umbral_mayorista=pedido.aplica_umbral_mayorista,
+        tiene_excepcion_precio=pedido.tiene_excepcion_precio,
+        excepcion_precio_detalle=pedido.excepcion_precio_detalle,
         importe_total=float(pedido.importe_total),
         saldo_pendiente=float(pedido.saldo_pendiente),
         observacion=pedido.observacion,
@@ -482,6 +640,8 @@ def _build_pedido_response(pedido: Pedido) -> PedidoResponse:
         longitud=pedido.longitud if pedido.longitud is not None else (pedido.cliente.longitud if pedido.cliente else None),
         bultos=pedido.bultos,
         reserva_stock=pedido.reserva_stock,
+        reserva_vigente=_debe_reservar(pedido),
+        avisos_stock=avisos or [],
         plan_pago=[_plan_pago_response(t) for t in pedido.plan_pago],
         items=items,
 
@@ -636,7 +796,7 @@ async def list_pedidos(
             "numero_pedido", "shipping_status", "payment_status", "fecha", "fecha_entrega",
             "importe_total", "cliente_nombre", "vendedor_nombre", "tipo_documento",
             "transporte", "modalidad_entrega", "sociedad", "despachado", "tipo_precio", "saldo_pendiente",
-            "repartidor_id", "repartidor_nombre",
+            "tipo_cliente", "tiene_excepcion_precio", "repartidor_id", "repartidor_nombre",
         },
         extra_mappings={
             "cliente_nombre": Cliente.nombre,
@@ -1062,7 +1222,7 @@ async def get_pedido(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Pedido no encontrado",
         )
-    return _build_pedido_response(pedido)
+    return _build_pedido_response(pedido, await _avisos_stock(db, pedido))
 
 
 @router.get("/{cliente_id}/pedidos_a_imputar")
@@ -1187,6 +1347,11 @@ async def create_pedido(
         longitud=envio_lon,
         reserva_stock=body.reserva_stock,
         tipo_precio=body.tipo_precio,
+        # Si no lo mandan explícito, la venta es del tipo del cliente. El schema ya
+        # normalizó `cliente.tipo` a minúsculas, así que un legado "MAYORISTA" no
+        # se cuela: la migración lo dejó en 'mayorista' o en NULL.
+        tipo_cliente=body.tipo_cliente or cliente.tipo,
+        aplica_umbral_mayorista=body.aplica_umbral_mayorista,
         importe_total=Decimal("0"),
         saldo_pendiente=Decimal("0"),
     )
@@ -1209,6 +1374,7 @@ async def create_pedido(
     # Create items - check for duplicates
     seen_products: set[int] = set()
     importe_total = Decimal("0")
+    desvios: list[str] = []
     for item_data in body.items:
         if item_data.producto_id in seen_products:
             raise HTTPException(
@@ -1233,13 +1399,19 @@ async def create_pedido(
         # La sociedad ya no interviene, es solo un dato de facturación.
         deposito_id = await _resolver_deposito(db, item_data, body.deposito_id)
         # reservar valida y mueve físico -> reservado en un solo paso; si no alcanza
-        # tira 400 sin haber tocado nada y el pedido entero se rechaza. Un pedido
-        # marcado para no mover stock se salta este paso: la mercadería todavía no
-        # entró y comprometerla daría negativo.
-        if pedido.reserva_stock:
+        # tira 400 sin haber tocado nada y el pedido entero se rechaza. En la
+        # práctica un pedido nace `borrador` y esto no corre: una cotización no
+        # compromete mercadería. Se deja por si alguna vez se crea ya confirmado.
+        if _debe_reservar(pedido):
             await stock_service.reservar(db, producto, deposito_id, cajas, blisters)
 
         comision = _comision_para(vendedor, producto)
+
+        # El producto ya está cargado y bloqueado por el `with_for_update` de
+        # arriba: detectar el desvío acá no cuesta ninguna query extra.
+        desvio = _desvio_de_lista(producto, item_data.precio_unitario, unidad_venta, pedido.tipo_precio)
+        if desvio:
+            desvios.append(desvio)
 
         pedido_item = PedidoItem(
             pedido_id=pedido.id,
@@ -1273,6 +1445,7 @@ async def create_pedido(
 
     pedido.importe_total = importe_total
     pedido.saldo_pendiente = importe_total
+    _aplicar_excepciones(pedido, desvios)
 
     if body.plan_pago:
         await _reemplazar_plan_pago(db, pedido, body.plan_pago)
@@ -1289,7 +1462,7 @@ async def create_pedido(
     result = await db.execute(query)
     pedido = result.scalar_one()
 
-    return _build_pedido_response(pedido)
+    return _build_pedido_response(pedido, await _avisos_stock(db, pedido))
 
 
 @router.put("/{id}")
@@ -1362,10 +1535,12 @@ async def update_pedido(
         except ValueError:
             raise HTTPException(status_code=400, detail="Tipo documento inválido")
 
-    # El tilde de "no descuenta stock" hay que leerlo ANTES del setattr: las
-    # reservas que existen hoy se hicieron con el valor viejo, y las que se van a
-    # crear responden al nuevo. Mezclarlos inventa o pierde mercadería.
-    reserva_previa = pedido.reserva_stock
+    # Si el pedido tenía reserva vigente hay que leerlo ANTES del setattr: las
+    # reservas que existen hoy se hicieron con el estado viejo, y las que se van a
+    # crear responden al nuevo. Mezclarlos inventa o pierde mercadería. Son DOS
+    # los campos que lo mueven —el tilde `reserva_stock` y el `shipping_status`,
+    # que este PUT también puede cambiar—, por eso se evalúa el predicado entero.
+    reservaba_antes = _debe_reservar(pedido)
 
     # La dirección de entrega se resuelve aparte: elegir una de la libreta tiene
     # que arrastrar el texto y las coordenadas, no solo el id.
@@ -1399,7 +1574,7 @@ async def update_pedido(
                 select(Producto).where(Producto.id == existing_item.producto_id).with_for_update()
             )
             producto = prod_result.scalar_one_or_none()
-            if producto and existing_item.deposito_id and reserva_previa:
+            if producto and existing_item.deposito_id and reservaba_antes:
                 # Se devuelve al mismo depósito del que salió, no al que tenga
                 # seleccionado el pedido ahora: la mercadería está donde estaba.
                 await stock_service.liberar_reserva(
@@ -1417,6 +1592,7 @@ async def update_pedido(
         vendedor = vendedor_result.scalar_one_or_none()
 
         importe_total = Decimal("0")
+        desvios: list[str] = []
         for item_data in body.items:
             prod_result = await db.execute(
                 select(Producto).where(Producto.id == item_data.producto_id).with_for_update()
@@ -1431,10 +1607,14 @@ async def update_pedido(
             # Resolver cantidades según el formato de venta de la línea (caja/blister)
             cajas, blisters, unidad_venta = _resolver_cantidades(item_data, producto)
             deposito_id = await _resolver_deposito(db, item_data, body.deposito_id)
-            if pedido.reserva_stock:
+            if _debe_reservar(pedido):
                 await stock_service.reservar(db, producto, deposito_id, cajas, blisters)
 
             comision = _comision_para(vendedor, producto)
+
+            desvio = _desvio_de_lista(producto, item_data.precio_unitario, unidad_venta, pedido.tipo_precio)
+            if desvio:
+                desvios.append(desvio)
 
             pedido_item = PedidoItem(
                 pedido_id=pedido.id,
@@ -1453,6 +1633,7 @@ async def update_pedido(
             importe_total += Decimal(str(item_data.precio_total))
 
         pedido.importe_total = importe_total
+        _aplicar_excepciones(pedido, desvios)
         sum_imputations_result = await db.execute(
             select(func.coalesce(func.sum(PagoImputacion.monto), 0)).where(PagoImputacion.pedido_id == id)
         )
@@ -1462,10 +1643,11 @@ async def update_pedido(
         # Auto-imputar pagos disponibles si hay saldo pendiente tras la actualización
         await imputar_pagos_a_pedido(db, pedido)
 
-    elif pedido.reserva_stock != reserva_previa:
-        # Cambió solo el tilde: las líneas siguen siendo las mismas, hay que
-        # comprometerlas o devolverlas todas.
-        await _aplicar_cambio_reserva(db, pedido, activar=pedido.reserva_stock)
+    elif _debe_reservar(pedido) != reservaba_antes:
+        # No cambiaron las líneas pero sí si corresponde reservarlas: se tocó el
+        # tilde, o el pedido pasó de borrador a pendiente por este mismo PUT. Hay
+        # que comprometerlas o devolverlas todas.
+        await _aplicar_cambio_reserva(db, pedido, activar=_debe_reservar(pedido))
 
     # Bitácora: se compara contra las fotos tomadas al principio. Hace falta el flush
     # para que los items recién creados existan en la sesión antes de releerlos.
@@ -1511,7 +1693,7 @@ async def update_pedido(
     result = await db.execute(reload_query)
     pedido = result.scalar_one()
 
-    return _build_pedido_response(pedido)
+    return _build_pedido_response(pedido, await _avisos_stock(db, pedido))
 
 
 @router.patch("/{id}/shipping-status")
@@ -1572,16 +1754,45 @@ async def update_shipping_status(
             detail="Solo depósito puede devolver un pedido a 'pendiente' para que se pueda editar.",
         )
 
-    # Stock adjustments on shipping change
+    # Precios fuera de lista: se exige el porqué al confirmar la cotización.
+    #
+    # No es una compuerta de aprobación —nadie más tiene que actuar y el pedido
+    # sigue su curso normal— sino validación de formulario: el pedido queda
+    # marcado y un admin lo revisa después. Y va acá y no en el `PUT` porque el
+    # form autoguarda: el desvío y la observación se tipean en momentos distintos,
+    # y exigirla en cada guardado haría imposible cargar el pedido.
+    if (
+        pedido.shipping_status == EstadoDespacho.borrador
+        and nuevo_shipping == EstadoDespacho.pendiente
+        and pedido.tiene_excepcion_precio
+        and not (pedido.observacion or "").strip()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "El pedido tiene precios fuera de lista: cargá una observación "
+                "explicando la excepción antes de confirmarlo."
+            ),
+        )
+
+    # Stock: la reserva la decide el estado, así que el movimiento sale de comparar
+    # el de ahora contra el de destino. Va acá arriba, ANTES de asignar el estado
+    # nuevo, porque `_debe_reservar` lee el estado actual del pedido.
+    reservaba = _debe_reservar(pedido)
+    reservara = pedido.reserva_stock and nuevo_shipping not in ESTADOS_SIN_RESERVA
+
     if nuevo_shipping == EstadoDespacho.entregado:
+        # La mercadería salió: la reserva se consume y el físico no vuelve.
         await _mover_reservas_pedido(db, pedido, devolver=False)
-    elif nuevo_shipping == EstadoDespacho.cancelado:
+    elif reservaba and not reservara:
+        # Cancelar: lo comprometido vuelve a ser stock vendible.
         await _mover_reservas_pedido(db, pedido, devolver=True)
-    elif pedido.shipping_status == EstadoDespacho.cancelado and pedido.reserva_stock:
-        # Reactivar: al cancelar se soltó la mercadería y pudo haberse vendido.
-        # Se vuelve a comprometer acá; si ya no alcanza, `reservar` tira 400
-        # diciendo qué producto y cuánto falta, y la transacción se revierte
-        # entera: el pedido sigue cancelado y el stock queda como estaba.
+    elif reservara and not reservaba:
+        # Confirmar una cotización (borrador -> pendiente), o reactivar un pedido
+        # cancelado. En los dos casos la mercadería estaba libre y pudo haberse
+        # vendido: se compromete recién ahora. Si ya no alcanza, `reservar` tira
+        # 400 diciendo qué producto y cuánto falta, y la transacción se revierte
+        # entera — el pedido se queda donde estaba y el stock intacto.
         await _aplicar_cambio_reserva(db, pedido, activar=True)
 
     estado_anterior = pedido.shipping_status
@@ -1614,7 +1825,9 @@ async def update_shipping_status(
     result = await db.execute(reload_query)
     pedido = result.scalar_one()
 
-    return _build_pedido_response(pedido)
+    # Un `cancelado -> borrador` devuelve el pedido a cotización: puede volver a
+    # estar corto de stock y el front tiene que enterarse en la misma respuesta.
+    return _build_pedido_response(pedido, await _avisos_stock(db, pedido))
 
 
 @router.patch("/{id}/logistica")

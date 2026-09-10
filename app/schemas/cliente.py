@@ -5,6 +5,29 @@ from typing import Optional
 
 from pydantic import BaseModel, field_validator
 
+from app.services.pricing_service import GRUPOS
+
+
+def _normalizar_tipo_cliente(v: Optional[str]) -> Optional[str]:
+    """Normaliza `tipo` a una de las listas de precios conocidas.
+
+    La columna es texto libre y arrastra datos viejos con mayúsculas ("MAYORISTA")
+    o abreviados. El form de pedidos siembra la lista de precios a partir de este
+    valor y, si no lo reconoce, cae en silencio a minorista: un cliente mayorista
+    terminaba cotizado al precio equivocado sin que nadie se enterara. Bajar a
+    minúsculas y limpiar espacios arregla el caso real.
+
+    Normaliza en vez de rechazar a propósito: `ClienteResponse` hereda de
+    `ClienteBase`, así que un `raise` acá haría explotar el listado entero de
+    clientes ante una sola fila con basura en la columna. Lo desconocido queda en
+    None, que es la verdad —no es ninguna de las listas— y el form lo muestra
+    vacío para que alguien lo corrija.
+    """
+    if v is None:
+        return v
+    normalizado = v.strip().lower()
+    return normalizado if normalizado in GRUPOS else None
+
 
 class ClienteBase(BaseModel):
     nombre: str
@@ -25,11 +48,16 @@ class ClienteBase(BaseModel):
     def format_razon_social(cls, v: Optional[str]) -> Optional[str]:
         return v.strip().title() if v else v
 
+    @field_validator("tipo")
+    @classmethod
+    def _chk_tipo(cls, v: Optional[str]) -> Optional[str]:
+        return _normalizar_tipo_cliente(v)
+
     telefono: Optional[str] = None
     whatsapp: Optional[str] = None
     email: Optional[str] = None
     categoria: Optional[str] = None
-    tipo: Optional[str] = None          # "mayorista" | "minorista"
+    tipo: Optional[str] = None          # grupo de precios: minorista | mayorista | comercio
     zona_id: Optional[int] = None
     condicion_pago: Optional[str] = None  # "contado" | "plazo"
     plazo_dias: Optional[int] = None
@@ -66,6 +94,11 @@ class ClienteUpdate(BaseModel):
     comentarios: Optional[str] = None
     transporte_habitual: Optional[str] = None
     aprobado: Optional[bool] = None
+
+    @field_validator("tipo")
+    @classmethod
+    def _chk_tipo(cls, v: Optional[str]) -> Optional[str]:
+        return _normalizar_tipo_cliente(v)
 
 
 class ClienteResponse(ClienteBase):

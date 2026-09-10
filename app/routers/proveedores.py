@@ -2,12 +2,13 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.user import User
 from app.models.proveedor import Proveedor
+from app.models.proveedor_cuenta import ProveedorCuenta
 from app.models.ingreso_mercaderia import IngresoMercaderia
 from app.models.notas_proveedor import NotaProveedor, TipoNota
 from app.models.cashback_proveedor import CashbackProveedor
@@ -17,6 +18,7 @@ from app.models.pago import Pago, TipoPago, TipoCuenta
 from app.models.pago_proveedor import PagoProveedor, PagoProveedorImputacion
 from app.schemas.proveedor import (
     ProveedorCreate, ProveedorUpdate, ProveedorResponse,
+    ProveedorCuentaCreate, ProveedorCuentaUpdate, ProveedorCuentaResponse,
     PagoPendienteInfo, NotaProveedorInfo, PagoDeudaProveedorRequest,
 )
 from app.services.movimientos_service import registrar_movimiento
@@ -55,13 +57,174 @@ async def _build_proveedor_dict(p: Proveedor, db: AsyncSession) -> dict:
         )
     )).scalar_one()
 
+    # Cuentas bancarias del proveedor: van en la misma respuesta porque la pantalla
+    # las muestra junto al saldo y pedirlas aparte serían N llamadas en el listado.
+    cuentas = (
+        await db.execute(
+            select(ProveedorCuenta)
+            .where(ProveedorCuenta.proveedor_id == p.id, ProveedorCuenta.activo.is_(True))
+            .order_by(ProveedorCuenta.es_default.desc(), ProveedorCuenta.id)
+        )
+    ).scalars().all()
+
     p_dict = ProveedorResponse.model_validate(p).model_dump()
     p_dict["saldo_pendiente_total"] = saldo_total
     p_dict["pagos_pendientes"] = [PagoPendienteInfo.model_validate(item).model_dump() for item in pendientes]
     p_dict["notas"] = [NotaProveedorInfo.model_validate(n).model_dump() for n in notas]
     p_dict["total_notas_credito"] = total_notas_credito
     p_dict["cashback_pendiente"] = Decimal(str(cashback_pendiente))
+    p_dict["cuentas"] = [ProveedorCuentaResponse.model_validate(c).model_dump() for c in cuentas]
     return p_dict
+
+
+# --- Libreta de cuentas bancarias del proveedor -------------------------------
+# Mismo patrón que las direcciones del cliente (`/clientes/{id}/direcciones`):
+# tabla hija, una marcada por defecto, baja lógica.
+
+
+async def _proveedor_o_404(db: AsyncSession, proveedor_id: int) -> Proveedor:
+    proveedor = (
+        await db.execute(select(Proveedor).where(Proveedor.id == proveedor_id))
+    ).scalar_one_or_none()
+    if proveedor is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proveedor no encontrado")
+    return proveedor
+
+
+async def _desmarcar_otras_default(db: AsyncSession, proveedor_id: int, excepto_id: int | None) -> None:
+    """Solo una cuenta puede ser la propuesta por defecto."""
+    q = sa_update(ProveedorCuenta).where(ProveedorCuenta.proveedor_id == proveedor_id)
+    if excepto_id is not None:
+        q = q.where(ProveedorCuenta.id != excepto_id)
+    await db.execute(q.values(es_default=False))
+
+
+async def _cuenta_o_404(db: AsyncSession, proveedor_id: int, cuenta_id: int) -> ProveedorCuenta:
+    cuenta = (
+        await db.execute(
+            select(ProveedorCuenta).where(
+                ProveedorCuenta.id == cuenta_id,
+                ProveedorCuenta.proveedor_id == proveedor_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if cuenta is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cuenta no encontrada")
+    return cuenta
+
+
+@router.get("/{proveedor_id}/cuentas", response_model=list[ProveedorCuentaResponse])
+async def list_cuentas_proveedor(
+    proveedor_id: int,
+    incluir_inactivas: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+):
+    await _proveedor_o_404(db, proveedor_id)
+    q = select(ProveedorCuenta).where(ProveedorCuenta.proveedor_id == proveedor_id)
+    if not incluir_inactivas:
+        q = q.where(ProveedorCuenta.activo.is_(True))
+    filas = (
+        await db.execute(q.order_by(ProveedorCuenta.es_default.desc(), ProveedorCuenta.id))
+    ).scalars().all()
+    return [ProveedorCuentaResponse.model_validate(c) for c in filas]
+
+
+@router.post(
+    "/{proveedor_id}/cuentas",
+    response_model=ProveedorCuentaResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_cuenta_proveedor(
+    proveedor_id: int,
+    body: ProveedorCuentaCreate,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    await _proveedor_o_404(db, proveedor_id)
+    cuenta = ProveedorCuenta(proveedor_id=proveedor_id, **body.model_dump())
+    db.add(cuenta)
+    await db.flush()
+    # La primera cuenta es la default aunque no la hayan marcado: si no, el combo
+    # de pago arrancaría vacío teniendo una sola opción.
+    ya_habia = (
+        await db.execute(
+            select(func.count())
+            .select_from(ProveedorCuenta)
+            .where(
+                ProveedorCuenta.proveedor_id == proveedor_id,
+                ProveedorCuenta.id != cuenta.id,
+                ProveedorCuenta.activo.is_(True),
+            )
+        )
+    ).scalar_one()
+    if cuenta.es_default or ya_habia == 0:
+        cuenta.es_default = True
+        await _desmarcar_otras_default(db, proveedor_id, cuenta.id)
+    await db.commit()
+
+    cuenta = (
+        await db.execute(select(ProveedorCuenta).where(ProveedorCuenta.id == cuenta.id))
+    ).scalar_one()
+    return ProveedorCuentaResponse.model_validate(cuenta)
+
+
+@router.put("/{proveedor_id}/cuentas/{cuenta_id}", response_model=ProveedorCuentaResponse)
+async def update_cuenta_proveedor(
+    proveedor_id: int,
+    cuenta_id: int,
+    body: ProveedorCuentaUpdate,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    cuenta = await _cuenta_o_404(db, proveedor_id, cuenta_id)
+
+    for campo, valor in body.model_dump(exclude_unset=True).items():
+        setattr(cuenta, campo, valor)
+
+    if cuenta.es_default:
+        await _desmarcar_otras_default(db, proveedor_id, cuenta.id)
+    await db.commit()
+
+    cuenta = (
+        await db.execute(select(ProveedorCuenta).where(ProveedorCuenta.id == cuenta_id))
+    ).scalar_one()
+    return ProveedorCuentaResponse.model_validate(cuenta)
+
+
+@router.delete("/{proveedor_id}/cuentas/{cuenta_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_cuenta_proveedor(
+    proveedor_id: int,
+    cuenta_id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: User = Depends(require_role(["admin", "super_admin"])),
+):
+    """Baja lógica. Los pagos ya hechos referencian la cuenta a la que se giró:
+    borrar la fila dejaría esos pagos sin poder decir a dónde fue la plata."""
+    cuenta = await _cuenta_o_404(db, proveedor_id, cuenta_id)
+    era_default = cuenta.es_default
+    cuenta.activo = False
+    cuenta.es_default = False
+    await db.flush()
+
+    # Si se dio de baja la default, se promueve la siguiente activa: dejar al
+    # proveedor sin ninguna marcada haría que el combo de pago arranque vacío.
+    if era_default:
+        siguiente = (
+            await db.execute(
+                select(ProveedorCuenta)
+                .where(
+                    ProveedorCuenta.proveedor_id == proveedor_id,
+                    ProveedorCuenta.activo.is_(True),
+                )
+                .order_by(ProveedorCuenta.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if siguiente is not None:
+            siguiente.es_default = True
+
+    await db.commit()
 
 
 @router.get("")
@@ -287,11 +450,30 @@ async def pagar_deuda_proveedor(
     pago_id_resuelto = pago_puente.id if pago_puente is not None else None
 
     # Always create PagoProveedor for full traceability
+    # Cuenta destino: si no la eligen, se usa la marcada por defecto en la libreta
+    # del proveedor. Se valida que sea de ESTE proveedor: sin el chequeo se podría
+    # dejar registrado un giro a la cuenta de otro.
+    proveedor_cuenta_id = body.proveedor_cuenta_id
+    if proveedor_cuenta_id is not None:
+        await _cuenta_o_404(db, proveedor_id, proveedor_cuenta_id)
+    else:
+        default = (
+            await db.execute(
+                select(ProveedorCuenta.id).where(
+                    ProveedorCuenta.proveedor_id == proveedor_id,
+                    ProveedorCuenta.activo.is_(True),
+                    ProveedorCuenta.es_default.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        proveedor_cuenta_id = default
+
     pp = PagoProveedor(
         proveedor_id=proveedor_id,
         usuario_id=current_user.id,
         pago_id=pago_id_resuelto,
         cuenta_id=body.cuenta_id,
+        proveedor_cuenta_id=proveedor_cuenta_id,
         importe=total_a_pagar,
         fecha_pago=fecha_pago,
         tipo_pago=metodo_enum,

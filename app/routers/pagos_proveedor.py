@@ -6,10 +6,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 # pyrefly: ignore [missing-import]
 from typing import List
+from decimal import Decimal
 
 from app.core.database import get_db
 from app.models.pago_proveedor import PagoProveedor
 from app.models.proveedor import Proveedor
+from app.models.proveedor_cuenta import ProveedorCuenta
 from app.models.pago import Pago, TipoPago, TipoCuenta
 from app.models.cuenta_sanalle import TipoMovimiento, CategoriaMovimiento
 from app.schemas.pago_proveedor import PagoProveedorCreate, PagoProveedorResponse
@@ -63,12 +65,47 @@ async def create_pago_proveedor(
             ),
         )
 
+    # Cuenta destino: si no la eligen, la marcada por defecto en la libreta del
+    # proveedor. Se valida que sea de ESTE proveedor, o se podría dejar registrado
+    # un giro a la cuenta de otro.
+    proveedor_cuenta_id = body.proveedor_cuenta_id
+    if proveedor_cuenta_id is not None:
+        pertenece = (
+            await db.execute(
+                select(ProveedorCuenta.id).where(
+                    ProveedorCuenta.id == proveedor_cuenta_id,
+                    ProveedorCuenta.proveedor_id == body.proveedor_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if pertenece is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La cuenta elegida no pertenece a este proveedor.",
+            )
+    else:
+        proveedor_cuenta_id = (
+            await db.execute(
+                select(ProveedorCuenta.id).where(
+                    ProveedorCuenta.proveedor_id == body.proveedor_id,
+                    ProveedorCuenta.activo.is_(True),
+                    ProveedorCuenta.es_default.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+
     pago = PagoProveedor(
         proveedor_id=body.proveedor_id,
         usuario_id=current_user.id,
         pago_id=body.pago_id,
         cuenta_id=body.cuenta_id,
-        importe=body.importe,
+        proveedor_cuenta_id=proveedor_cuenta_id,
+        # El schema declara `importe: float` y los saldos del proveedor son
+        # Decimal. Sin convertir acá, el `-=` de más abajo revienta con
+        # "unsupported operand type(s) for -=: 'Decimal' and 'float'" —
+        # SQLAlchemy no convierte el atributo al hacer flush, se queda con el
+        # valor de Python tal cual se lo pasaron.
+        importe=Decimal(str(body.importe)),
         fecha_pago=body.fecha_pago,
         tipo_pago=tipo_pago_enum,
         tipo_cuenta=tipo_cuenta_enum,
@@ -112,6 +149,7 @@ async def create_pago_proveedor(
         usuario_id=pago.usuario_id,
         pago_id=pago.pago_id,
         cuenta_id=pago.cuenta_id,
+        proveedor_cuenta_id=pago.proveedor_cuenta_id,
         importe=float(pago.importe),
         fecha_pago=pago.fecha_pago,
         tipo_pago=pago.tipo_pago.value,
@@ -149,6 +187,7 @@ async def list_pagos_proveedor(
             usuario_id=pp.usuario_id,
             pago_id=pp.pago_id,
             cuenta_id=pp.cuenta_id,
+            proveedor_cuenta_id=pp.proveedor_cuenta_id,
             importe=float(pp.importe),
             fecha_pago=pp.fecha_pago,
             tipo_pago=pp.tipo_pago.value,

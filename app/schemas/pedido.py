@@ -5,6 +5,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.services.pricing_service import GRUPOS
+
 # Espeja `ModalidadEntrega` de app/models/pedido.py. La columna es texto, así que
 # esta validación es la que evita que entre un valor que el remito no sabe armar.
 MODALIDADES_ENTREGA = ("envio", "retira")
@@ -16,6 +18,22 @@ def _validar_modalidad(v: Optional[str]) -> Optional[str]:
     if v not in MODALIDADES_ENTREGA:
         raise ValueError(f"modalidad_entrega inválida: {v!r}. Válidas: {', '.join(MODALIDADES_ENTREGA)}")
     return v
+
+
+def _validar_grupo(v: Optional[str]) -> Optional[str]:
+    """Normaliza y valida un grupo contra `pricing_service.GRUPOS`.
+
+    Se reusa la constante en vez de repetir la lista acá: agregar una lista de
+    precios tiene que ser una sola línea en `pricing_service`.
+    """
+    if v is None:
+        return v
+    normalizado = v.strip().lower()
+    if not normalizado:
+        return None
+    if normalizado not in GRUPOS:
+        raise ValueError(f"tipo inválido: {v!r}. Válidos: {', '.join(GRUPOS)}")
+    return normalizado
 
 
 class PedidoItemBase(BaseModel):
@@ -97,6 +115,11 @@ class PedidoBase(BaseModel):
     # Depósito por defecto del pedido: se aplica a las líneas que no traen uno propio.
     deposito_id: Optional[int] = None
     tipo_precio: Optional[str] = "minorista"
+    # Qué clase de venta es, independiente de la lista con la que se cotizó.
+    # None = que lo herede del `tipo` del cliente.
+    tipo_cliente: Optional[str] = None
+    # False = este pedido no escala solo a mayorista aunque supere el umbral.
+    aplica_umbral_mayorista: bool = True
     # False = el pedido no compromete mercadería. Para operaciones de volumen que
     # se facturan antes de que entre el ingreso del proveedor.
     reserva_stock: bool = True
@@ -105,6 +128,11 @@ class PedidoBase(BaseModel):
     @classmethod
     def _chk_modalidad(cls, v: Optional[str]) -> Optional[str]:
         return _validar_modalidad(v)
+
+    @field_validator("tipo_precio", "tipo_cliente")
+    @classmethod
+    def _chk_grupo(cls, v: Optional[str]) -> Optional[str]:
+        return _validar_grupo(v)
 
 
 class PedidoCreate(PedidoBase):
@@ -127,6 +155,8 @@ class PedidoUpdate(BaseModel):
     sociedad: Optional[str] = None
     deposito_id: Optional[int] = None
     tipo_precio: Optional[str] = None
+    tipo_cliente: Optional[str] = None
+    aplica_umbral_mayorista: Optional[bool] = None
     vendedor_id: Optional[int] = None
     reserva_stock: Optional[bool] = None
     items: Optional[list[PedidoItemCreate]] = None
@@ -137,6 +167,11 @@ class PedidoUpdate(BaseModel):
     @classmethod
     def _chk_modalidad(cls, v: Optional[str]) -> Optional[str]:
         return _validar_modalidad(v)
+
+    @field_validator("tipo_precio", "tipo_cliente")
+    @classmethod
+    def _chk_grupo(cls, v: Optional[str]) -> Optional[str]:
+        return _validar_grupo(v)
 
 
 class PedidoLogisticaUpdate(BaseModel):
@@ -169,6 +204,21 @@ class AsignarRepartidorRequest(BaseModel):
     repartidor_id: int
 
 
+class AvisoStock(BaseModel):
+    """Una línea de la cotización que pide más de lo que hay disponible.
+
+    Es un aviso, no un error: la cotización se guarda igual. Recién al
+    confirmarla (borrador -> pendiente) el faltante frena la operación.
+    """
+
+    producto_id: int
+    producto_nombre: str
+    deposito_id: int
+    deposito_nombre: Optional[str] = None
+    pedido: str  # "5 caja(s)" — ya formateado con la unidad del producto
+    disponible: str
+
+
 class PedidoResponse(BaseModel):
     id: int
     numero_pedido: str
@@ -192,6 +242,12 @@ class PedidoResponse(BaseModel):
     # varios cuando una línea se tomó de otro depósito por falta de stock.
     depositos: list[str] = []
     tipo_precio: Optional[str] = None
+    tipo_cliente: Optional[str] = None
+    aplica_umbral_mayorista: bool = True
+    # Alguna línea salió a un precio distinto del de lista. Informativo: no frena
+    # el pedido, pero al confirmarlo se le exige una observación al vendedor.
+    tiene_excepcion_precio: bool = False
+    excepcion_precio_detalle: Optional[str] = None
     importe_total: float
     saldo_pendiente: float
     observacion: Optional[str] = None
@@ -209,6 +265,14 @@ class PedidoResponse(BaseModel):
     longitud: Optional[float] = None
     bultos: Optional[int] = 0
     reserva_stock: bool = True
+    # `reserva_stock` es la intención ("este pedido descuenta stock"); esto es el
+    # hecho ("hoy tiene mercadería comprometida"). Difieren mientras el pedido es
+    # un borrador: el front lo necesita para no contar dos veces lo reservado.
+    reserva_vigente: bool = True
+    # Sólo se calcula en el detalle y al guardar (GET /{id}, POST, PUT). En el
+    # listado va vacío a propósito: son cientos de pedidos y costaría una query
+    # de stock por cada uno.
+    avisos_stock: list[AvisoStock] = []
     items: list[PedidoItemResponse] = []
     plan_pago: list[PedidoPlanPagoResponse] = []
 

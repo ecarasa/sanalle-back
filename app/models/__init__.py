@@ -8,6 +8,7 @@ from app.models.pedido_plan_pago import PedidoPlanPago
 from app.models.pago import Pago
 from app.models.tipo_iva import TipoIva
 from app.models.proveedor import Proveedor
+from app.models.proveedor_cuenta import ProveedorCuenta
 from app.models.banco import Banco
 from app.models.localidad import Localidad
 from app.models.pago_imputacion import PagoImputacion
@@ -75,6 +76,7 @@ __all__ = [
     "Cuenta",
     "Entidad",
     "ClienteDireccion",
+    "ProveedorCuenta",
     "PedidoPlanPago",
     "TomaInventario",
     "TomaInventarioItem",

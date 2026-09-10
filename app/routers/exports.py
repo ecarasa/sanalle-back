@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 import io
 import json
@@ -10,6 +10,7 @@ from app.core.database import get_db
 from app.models.user import User
 from app.models.cliente import Cliente
 from app.models.producto import Producto
+from app.models.laboratorios import Laboratorio
 from app.models.deposito import Deposito
 from app.models.stock_producto_deposito import StockProductoDeposito
 from app.models.pedido import Pedido
@@ -280,9 +281,18 @@ async def export_productos(
             Producto.nombre.ilike(search_filter) | Producto.codigo.ilike(search_filter)
         )
 
+    # Mismo orden que la lista de precios pública: primero el orden que fija la
+    # droguería para los laboratorios, después el nombre. Hace falta el outerjoin
+    # explícito — con `selectinload` solo no se puede ordenar por una columna del
+    # laboratorio, porque viaja en una query aparte.
     query = (
-        query.options(selectinload(Producto.laboratorio))
-        .order_by(Producto.codigo)
+        query.outerjoin(Laboratorio, Producto.laboratorio_id == Laboratorio.id)
+        .options(selectinload(Producto.laboratorio))
+        .order_by(
+            func.coalesce(Laboratorio.orden, 999999),
+            func.lower(func.coalesce(Laboratorio.nombre, "￿")),
+            func.lower(Producto.nombre),
+        )
     )
     result = await db.execute(query)
     productos = result.scalars().unique().all()

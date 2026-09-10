@@ -646,10 +646,14 @@ async def list_cambios_producto(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    _current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
 ):
     """Quién cambió qué en la ficha de un producto. Las cantidades van aparte,
-    en `/movimientos-stock`: son dos preguntas distintas."""
+    en `/movimientos-stock`: son dos preguntas distintas.
+
+    Restringido a administración: audita el maestro de productos (precios,
+    márgenes, costos), que es dato comercial y no de depósito.
+    """
     query = select(BitacoraProducto).order_by(BitacoraProducto.id.desc())
     if search:
         patron = f"%{search}%"
@@ -705,7 +709,9 @@ async def list_cambios_producto(
 
 
 @router.get("/cambios-producto/campos")
-async def list_campos_auditados(_current_user: User = Depends(get_current_user)):
+async def list_campos_auditados(
+    _current_user: User = Depends(require_role(ROLES_MAESTRO_PRODUCTOS)),
+):
     """Los campos que se auditan, con su etiqueta, para armar el filtro."""
     return [
         {"campo": c, "label": bitacora_producto_service.ETIQUETAS.get(c, c)}

@@ -94,6 +94,31 @@ def lista_de(grupo: str, formato: str | None = None) -> ListaPrecio | None:
     return None
 
 
+def precio_esperado(producto: "Producto", grupo: str, unidad_venta: str = "caja") -> Decimal | None:
+    """Precio de lista que le corresponde a una línea de pedido.
+
+    Es el precio contra el que se detecta una excepción. Tiene que vivir acá y no
+    en el router porque el cliente manda `precio_lista` por su cuenta y, cuando el
+    vendedor pisa el precio a mano, el form conserva el viejo "de referencia":
+    comparar contra ese valor no detectaría nada.
+
+    Espeja `precioBasePorUnidad` de frontend/src/lib/ventas.ts — el blíster sale
+    de dividir el precio de caja, y si el producto no fracciona cae al de caja.
+    None = el producto no se vende en esa lista.
+    """
+    lista = lista_de(grupo)
+    if lista is None:
+        return None
+    base = _dec(getattr(producto, lista.precio_field, None))
+    if base is None:
+        return None
+    if unidad_venta == "blister":
+        por_caja = producto.get_blisters_por_caja
+        if por_caja and por_caja > 1:
+            return _q(base / Decimal(por_caja))
+    return _q(base)
+
+
 def _dec(value) -> Decimal | None:
     """Convierte a Decimal preservando None. Un string vacío también es None."""
     if value is None or value == "":

@@ -12,7 +12,12 @@ class Laboratorio(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     nombre: Mapped[str] = mapped_column(String(255), nullable=False, index=True, unique=True)
     activo: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
-    
+    # Orden en que los laboratorios se muestran en la lista de precios. La droguería
+    # tiene un orden propio (por importancia comercial, no alfabético) y las listas
+    # impresas tienen que respetarlo. 0 = sin definir, va al final.
+    orden: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

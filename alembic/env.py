@@ -18,6 +18,7 @@ from app.models.pedido_item import PedidoItem  # noqa: F401
 from app.models.pago import Pago  # noqa: F401
 from app.models.tipo_iva import TipoIva  # noqa: F401
 from app.models.proveedor import Proveedor  # noqa: F401
+from app.models.proveedor_cuenta import ProveedorCuenta  # noqa: F401
 from app.models.banco import Banco  # noqa: F401
 from app.models.localidad import Localidad  # noqa: F401
 from app.models.pago_imputacion import PagoImputacion  # noqa: F401

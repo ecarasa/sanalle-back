@@ -10,9 +10,12 @@ Cada fila tiene dos bolsas:
 
 El ciclo de un pedido mueve stock entre esas bolsas y nunca las duplica:
 
-    crear pedido      físico -> reservado     (reservar)
+    confirmar pedido  físico -> reservado     (reservar)
     entregar          reservado -> fuera      (consumir_reserva)
     cancelar/borrar   reservado -> físico     (liberar_reserva)
+
+"Confirmar" es `borrador -> pendiente`: una cotización en borrador no compromete
+nada, y por eso es el único paso del ciclo que puede fallar por falta de stock.
 
 Todas las funciones que escriben toman la fila con `FOR UPDATE`, así dos ventas
 simultáneas del mismo producto se serializan y no pueden sobrevender.
@@ -23,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fastapi import HTTPException, status
-from sqlalchemy import case, func, literal, select
+from sqlalchemy import Integer, case, cast, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.deposito import Deposito
@@ -99,6 +102,13 @@ SQL_TOTAL_BLISTERS = (
     .correlate(Producto)
     .scalar_subquery()
 )
+
+# Total en CAJAS enteras: la misma cuenta que `total_bl // por_caja` hace en
+# Python al armar la respuesta. El `floor` + `cast` no son decorativos: en
+# SQLAlchemy 2.0 `Integer / Integer` es división real y la columna sale NUMERIC
+# (12.5000000000000000). La grilla mostraba 12 y filtrar por 12 no traía nada,
+# porque el filtro comparaba contra el número con decimales.
+SQL_TOTAL_CAJAS = cast(func.floor(SQL_TOTAL_BLISTERS / SQL_POR_CAJA), Integer)
 
 SQL_MINIMO_BLISTERS = (
     func.coalesce(Producto.stock_minimo_cajas, 0) * SQL_POR_CAJA

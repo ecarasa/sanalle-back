@@ -1,5 +1,5 @@
 from sqlalchemy import Integer, String, Numeric, Boolean, DateTime, func, Enum
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 from decimal import Decimal
 from datetime import datetime
 from sqlalchemy.dialects.postgresql import JSONB
@@ -49,6 +49,16 @@ class Proveedor(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    # Cuentas bancarias en las que se le paga. Mismo patrón que la libreta de
+    # direcciones del cliente: `lazy="noload"` para que no se cargue sola en los
+    # listados, y `delete-orphan` para que sacarla de la colección la borre.
+    cuentas: Mapped[list["ProveedorCuenta"]] = relationship(  # noqa: F821
+        "ProveedorCuenta",
+        back_populates="proveedor",
+        lazy="noload",
+        cascade="all, delete-orphan",
     )
 
     def __repr__(self) -> str:

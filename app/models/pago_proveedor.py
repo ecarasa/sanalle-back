@@ -25,6 +25,13 @@ class PagoProveedor(Base):
     cuenta_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("cuentas.id"), nullable=True, index=True
     )
+    # Cuenta del PROVEEDOR a la que se transfirió. Es el otro extremo del giro y
+    # es lo que permite contestar "¿a qué CBU le pagamos esta factura?".
+    # `SET NULL` y no `CASCADE`: si mañana se borra la cuenta de la libreta, el
+    # pago tiene que sobrevivir — es un hecho contable, no un dato de la libreta.
+    proveedor_cuenta_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("proveedor_cuentas.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     importe: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     fecha_pago: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     tipo_pago: Mapped[TipoPago] = mapped_column(

@@ -21,6 +21,9 @@ class PagoProveedorBase(BaseModel):
     tipo_pago: str
     tipo_cuenta: str = "remito"
     cuenta_id: Optional[int] = None  # cuenta de la empresa desde donde sale la plata
+    # Cuenta del PROVEEDOR a la que se transfirió: el otro extremo del giro.
+    # None = que el backend use la marcada por defecto en su libreta.
+    proveedor_cuenta_id: Optional[int] = None
     referencia_pago: Optional[str] = None
     observacion: Optional[str] = None
 
