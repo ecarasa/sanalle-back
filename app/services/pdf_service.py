@@ -790,23 +790,45 @@ def _remito_flowables(
     # --- Plan de cobro (cómo se cobra y a qué cuenta entra cada parte) ---
     # Es una indicación para cobranza, no un cobro registrado: por eso va abajo
     # del total y no forma parte de los importes del comprobante.
+    # `forma_pago` es lo que carga ventas hoy (un combo simple). El `plan_pago`
+    # multi-tramo quedó sólo para los pedidos viejos que lo tengan cargado: si hay
+    # uno, se imprime ese, que es más detallado.
     plan_pago = pedido_data.get('plan_pago') or []
+    forma_pago = pedido_data.get('forma_pago')
+    if not plan_pago and forma_pago:
+        plan_pago = [{'forma': str(forma_pago).capitalize(), 'cuenta_nombre': None, 'importe': 0}]
+        _solo_forma = True
+    else:
+        _solo_forma = False
     if plan_pago:
         pp_title_st = ParagraphStyle('_ppt', fontName='Helvetica-Bold', fontSize=8, textColor=BLUE, leading=11)
         pp_cell_st = ParagraphStyle('_ppc', fontName='Helvetica', fontSize=8.5, textColor=colors.black, leading=12)
         pp_num_st = ParagraphStyle('_ppn', parent=pp_cell_st, alignment=TA_RIGHT)
 
-        filas = [[Paragraph("FORMA DE PAGO", pp_title_st),
-                  Paragraph("CUENTA", pp_title_st),
-                  Paragraph("IMPORTE", ParagraphStyle('_ppth', parent=pp_title_st, alignment=TA_RIGHT))]]
-        for tramo in plan_pago:
-            filas.append([
-                Paragraph(str(tramo.get('forma') or '-'), pp_cell_st),
-                Paragraph(str(tramo.get('cuenta_nombre') or '-'), pp_cell_st),
-                Paragraph(f"$ {float(tramo.get('importe') or 0):,.2f}", pp_num_st),
-            ])
+        if _solo_forma:
+            # Una sola forma y sin importes: la tabla de 3 columnas quedaría con
+            # dos guiones al lado. Una línea alcanza.
+            filas = [[Paragraph("FORMA DE PAGO", pp_title_st),
+                      Paragraph(str(plan_pago[0].get('forma') or '-'), pp_cell_st)]]
+        else:
+            filas = [[Paragraph("FORMA DE PAGO", pp_title_st),
+                      Paragraph("CUENTA", pp_title_st),
+                      Paragraph("IMPORTE", ParagraphStyle('_ppth', parent=pp_title_st, alignment=TA_RIGHT))]]
+            for tramo in plan_pago:
+                filas.append([
+                    Paragraph(str(tramo.get('forma') or '-'), pp_cell_st),
+                    Paragraph(str(tramo.get('cuenta_nombre') or '-'), pp_cell_st),
+                    Paragraph(f"$ {float(tramo.get('importe') or 0):,.2f}", pp_num_st),
+                ])
 
-        pp_box = Table(filas, colWidths=[content_w * 0.4, content_w * 0.4, content_w * 0.2])
+        # Los anchos tienen que coincidir con la cantidad de columnas o ReportLab
+        # rompe: la vista simple es de 2, la del plan de tramos de 3.
+        pp_widths = (
+            [content_w * 0.35, content_w * 0.65]
+            if _solo_forma
+            else [content_w * 0.4, content_w * 0.4, content_w * 0.2]
+        )
+        pp_box = Table(filas, colWidths=pp_widths)
         pp_box.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, -1), LIGHT_BG),
             ('BOX', (0, 0), (-1, -1), 0.6, CARD_BORDER),

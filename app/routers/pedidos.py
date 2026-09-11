@@ -615,6 +615,7 @@ def _build_pedido_response(
         transporte=pedido.transporte,
         modalidad_entrega=pedido.modalidad_entrega,
         fecha_compromiso_pago=pedido.fecha_compromiso_pago,
+        forma_pago=pedido.forma_pago,
         despachado=pedido.despachado,
         sociedad=pedido.sociedad,
         depositos=_depositos_de(pedido),
@@ -1340,6 +1341,7 @@ async def create_pedido(
         transporte=body.transporte or cliente.transporte_habitual,
         modalidad_entrega=body.modalidad_entrega or _modalidad_por_defecto(cliente),
         fecha_compromiso_pago=body.fecha_compromiso_pago,
+        forma_pago=body.forma_pago,
         sociedad=body.sociedad,
         observacion=body.observacion,
         direccion_entrega_id=direccion_id,
@@ -1513,7 +1515,12 @@ async def update_pedido(
     items_previos = snapshot_items(pedido.items)
 
     # Update scalar fields
-    update_data = body.model_dump(exclude_unset=True, exclude={"items", "deposito_id"})
+    # `plan_pago` va excluido igual que `items`: los dos son colecciones que se
+    # reemplazan con sus propios helpers más abajo. Sin excluirlo, `model_dump`
+    # lo convierte en una lista de diccionarios y el `setattr` se los asigna a la
+    # relación, que explota con "'dict' object has no attribute
+    # '_sa_instance_state'". Cualquier PUT con un plan cargado devolvía 500.
+    update_data = body.model_dump(exclude_unset=True, exclude={"items", "deposito_id", "plan_pago"})
     if "shipping_status" in update_data and update_data["shipping_status"] is not None:
         try:
             update_data["shipping_status"] = EstadoDespacho(update_data["shipping_status"])

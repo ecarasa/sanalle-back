@@ -102,6 +102,12 @@ class Pedido(Base):
         index=True,
     )
     fecha_compromiso_pago: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Cómo se va a cobrar: efectivo | transferencia | cheque. Es una indicación
+    # para cobranza, no registra el cobro. Reemplaza al `plan_pago` multi-tramo,
+    # que pedía importe y cuenta por cada parte y nadie completaba.
+    # Los valores son los de `TipoPago` para que, cuando se registre el pago de
+    # verdad, la forma coincida y no haya que traducir entre dos vocabularios.
+    forma_pago: Mapped[str | None] = mapped_column(String(30), nullable=True)
     despachado: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     sociedad: Mapped[str | None] = mapped_column(String(20), nullable=True)  # "sanalle" | "farmacare"
     importe_total: Mapped[Decimal] = mapped_column(

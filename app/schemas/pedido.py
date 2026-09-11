@@ -7,6 +7,23 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.services.pricing_service import GRUPOS
 
+# Formas de cobro que se ofrecen en el pedido. Son valores de `TipoPago`
+# (app/models/pago.py) a propósito: cuando después se registra el cobro real, la
+# forma tiene que coincidir sin traducir. `retencion` existe en el enum pero no
+# se ofrece acá — no es algo que se planifique al tomar el pedido.
+FORMAS_PAGO = ("efectivo", "transferencia", "cheque")
+
+
+def _validar_forma_pago(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return v
+    normalizado = v.strip().lower()
+    if not normalizado:
+        return None
+    if normalizado not in FORMAS_PAGO:
+        raise ValueError(f"forma_pago inválida: {v!r}. Válidas: {', '.join(FORMAS_PAGO)}")
+    return normalizado
+
 # Espeja `ModalidadEntrega` de app/models/pedido.py. La columna es texto, así que
 # esta validación es la que evita que entre un valor que el remito no sabe armar.
 MODALIDADES_ENTREGA = ("envio", "retira")
@@ -111,6 +128,8 @@ class PedidoBase(BaseModel):
     direccion_entrega_id: Optional[int] = None
     direccion_entrega: Optional[str] = None  # envío: por defecto el domicilio del cliente, editable
     fecha_compromiso_pago: Optional[date] = None
+    # Cómo se va a cobrar. Indicación para cobranza: no registra el cobro.
+    forma_pago: Optional[str] = None
     sociedad: Optional[str] = None  # "sanalle" | "farmacare" — solo facturación
     # Depósito por defecto del pedido: se aplica a las líneas que no traen uno propio.
     deposito_id: Optional[int] = None
@@ -134,6 +153,11 @@ class PedidoBase(BaseModel):
     def _chk_grupo(cls, v: Optional[str]) -> Optional[str]:
         return _validar_grupo(v)
 
+    @field_validator("forma_pago")
+    @classmethod
+    def _chk_forma_pago(cls, v: Optional[str]) -> Optional[str]:
+        return _validar_forma_pago(v)
+
 
 class PedidoCreate(PedidoBase):
     items: list[PedidoItemCreate] = []
@@ -152,6 +176,7 @@ class PedidoUpdate(BaseModel):
     direccion_entrega_id: Optional[int] = None
     direccion_entrega: Optional[str] = None
     fecha_compromiso_pago: Optional[date] = None
+    forma_pago: Optional[str] = None
     sociedad: Optional[str] = None
     deposito_id: Optional[int] = None
     tipo_precio: Optional[str] = None
@@ -172,6 +197,11 @@ class PedidoUpdate(BaseModel):
     @classmethod
     def _chk_grupo(cls, v: Optional[str]) -> Optional[str]:
         return _validar_grupo(v)
+
+    @field_validator("forma_pago")
+    @classmethod
+    def _chk_forma_pago(cls, v: Optional[str]) -> Optional[str]:
+        return _validar_forma_pago(v)
 
 
 class PedidoLogisticaUpdate(BaseModel):
@@ -236,6 +266,7 @@ class PedidoResponse(BaseModel):
     transporte: Optional[str] = None
     modalidad_entrega: str = "envio"
     fecha_compromiso_pago: Optional[date] = None
+    forma_pago: Optional[str] = None
     despachado: bool = False
     sociedad: Optional[str] = None
     # Depósitos involucrados, ya resueltos a nombre. Normalmente uno solo; son
