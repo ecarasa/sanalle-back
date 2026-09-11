@@ -546,8 +546,30 @@ async def delete_direccion(
     ).scalar_one_or_none()
     if direccion is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dirección no encontrada")
+
+    era_default = direccion.es_default
     direccion.activo = False
     direccion.es_default = False
+    await db.flush()
+
+    # Si se dio de baja la principal, asciende la siguiente activa. Un cliente con
+    # direcciones pero ninguna marcada dejaba el selector del pedido sin proponer
+    # nada, y el vendedor terminaba tipeando a mano una que ya estaba cargada.
+    if era_default:
+        siguiente = (
+            await db.execute(
+                select(ClienteDireccion)
+                .where(
+                    ClienteDireccion.cliente_id == cliente_id,
+                    ClienteDireccion.activo.is_(True),
+                )
+                .order_by(ClienteDireccion.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if siguiente is not None:
+            siguiente.es_default = True
+
     await db.commit()
 
 
