@@ -629,6 +629,7 @@ def _build_pedido_response(
         cliente_domicilio=pedido.cliente.domicilio if pedido.cliente else None,
         cliente_telefono=pedido.cliente.telefono or pedido.cliente.whatsapp if pedido.cliente else None,
         cliente_localidad=pedido.cliente.localidad_rel.nombre if pedido.cliente and pedido.cliente.localidad_rel else None,
+        cliente_localidad_id=pedido.cliente.localidad_id if pedido.cliente else None,
         cliente_codigo_postal=pedido.cliente.localidad_rel.codigo_postal if pedido.cliente and pedido.cliente.localidad_rel else None,
         cliente_provincia=pedido.cliente.localidad_rel.provincia if pedido.cliente and pedido.cliente.localidad_rel else None,
         cliente_zona=pedido.cliente.zona_rel.nombre if pedido.cliente and pedido.cliente.zona_rel else None,

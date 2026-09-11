@@ -254,6 +254,10 @@ class PedidoResponse(BaseModel):
     cliente_domicilio: Optional[str] = None
     cliente_telefono: Optional[str] = None
     cliente_localidad: Optional[str] = None
+    # El id, además del nombre: al guardar una dirección nueva en la libreta desde
+    # el pedido hace falta para geocodificarla (sin localidad el geocoder no ubica
+    # nada y la entrega no aparece en el mapa de reparto).
+    cliente_localidad_id: Optional[int] = None
     cliente_codigo_postal: Optional[str] = None
     cliente_provincia: Optional[str] = None
     cliente_zona: Optional[str] = None
