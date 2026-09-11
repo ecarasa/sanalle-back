@@ -258,6 +258,10 @@ class PedidoResponse(BaseModel):
     vendedor_id: int
     vendedor_nombre: Optional[str] = None
     shipping_status: str
+    # cotizacion | pedido. No es settable desde el cliente (no está en
+    # PedidoBase/PedidoUpdate a propósito): el servidor decide cuándo se
+    # confirma, ver update_shipping_status en routers/pedidos.py.
+    tipo_pedido: str = "cotizacion"
     payment_status: str
     semaforo: Optional[str] = None  # computed: rojo/azul/verde/amarillo/gris
     tipo_documento: Optional[str] = None

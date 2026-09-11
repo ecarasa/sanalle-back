@@ -9,7 +9,7 @@ from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.models.cliente import Cliente
 from app.models.pago import Pago, TipoPago
-from app.models.pedido import Pedido, EstadoPago as EstadoPagoPedido
+from app.models.pedido import Pedido, EstadoPago as EstadoPagoPedido, TIPO_PEDIDO
 from app.models.pedido_item import PedidoItem
 from app.models.producto import Producto
 from app.models.historial_pvp_producto import HistorialPvpProducto
@@ -229,10 +229,13 @@ async def get_calendario_unificado(
     """
     
     # 1. Fetch Entregas (Pedidos)
+    # Sólo pedidos confirmados: una cotización sin confirmar no es una entrega
+    # comprometida, aunque tenga una fecha_entrega sugerida.
     stmt_pedidos = (
         select(Pedido)
         .options(selectinload(Pedido.cliente))
         .where(Pedido.fecha_entrega.isnot(None))
+        .where(Pedido.tipo_pedido == TIPO_PEDIDO)
     )
     if current_user.rol.value == "ventas":
         stmt_pedidos = stmt_pedidos.where(Pedido.vendedor_id == current_user.id)
@@ -263,6 +266,7 @@ async def get_calendario_unificado(
         .where(Pedido.fecha_compromiso_pago.isnot(None))
         .where(Pedido.payment_status == EstadoPagoPedido.pendiente)
         .where(Pedido.saldo_pendiente > 0)
+        .where(Pedido.tipo_pedido == TIPO_PEDIDO)
     )
     stmt_cobros_parciales = (
         select(Pedido)
@@ -270,12 +274,14 @@ async def get_calendario_unificado(
         .where(Pedido.fecha_compromiso_pago.isnot(None))
         .where(Pedido.payment_status == EstadoPagoPedido.parcial)
         .where(Pedido.saldo_pendiente > 0)
+        .where(Pedido.tipo_pedido == TIPO_PEDIDO)
     )
     stmt_cobros_pagados = (
         select(Pedido)
         .options(selectinload(Pedido.cliente))
         .where(Pedido.fecha_compromiso_pago.isnot(None))
         .where(Pedido.payment_status == EstadoPagoPedido.pagado)
+        .where(Pedido.tipo_pedido == TIPO_PEDIDO)
     )
 
     res_venc_pendientes, res_venc_parciales, res_cobros_pend, res_cobros_parc, res_cobros_pag = (

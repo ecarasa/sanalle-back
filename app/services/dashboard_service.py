@@ -1,6 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract, and_, Date
 from datetime import datetime, date, timedelta
+from app.utils.tz import ahora_ar
 from app.models.pedido import ESTADOS_NO_COMPUTABLES, Pedido, EstadoDespacho
 from app.models.pago import Pago, EstadoPago
 from app.models.producto import Producto
@@ -32,7 +33,7 @@ def _rango_pedido_filters(desde: date | None, hasta: date | None) -> list:
 
 def _six_months_range(ref: date | None = None):
     """Return (six_months_ago date, month_labels list) for the 6 months ending at ref (or now)."""
-    base = ref or datetime.now().date()
+    base = ref or ahora_ar().date()
     months = []
     for i in range(5, -1, -1):
         m = base.month - i
@@ -47,7 +48,7 @@ def _six_months_range(ref: date | None = None):
 
 def _month_bounds(mes: str | None = None):
     """Return (month_start, next_month_start) for the given 'YYYY-MM' string or current month."""
-    now = datetime.now()
+    now = ahora_ar()
     month_start = date(now.year, now.month, 1)
     if mes:
         try:
@@ -98,7 +99,7 @@ async def get_ventas_dashboard(db: AsyncSession, user_id: int, desde: str | None
     PERÍODO elegido [desde, hasta] (inclusive); si no se pasa, cae al mes actual.
     Cobrado = importe_total − saldo_pendiente.
     """
-    now = datetime.now()
+    now = ahora_ar()
     month_start = date(now.year, now.month, 1)
 
     # Rango efectivo del período (cae al mes actual si no viene nada).

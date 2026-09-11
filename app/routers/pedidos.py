@@ -4,6 +4,7 @@ import os
 from collections import defaultdict
 
 from datetime import date, datetime, timedelta, timezone
+from app.utils.tz import hoy_ar
 from decimal import Decimal
 import httpx
 import hashlib
@@ -24,6 +25,8 @@ from app.models.pedido import (
     EstadoPago as EstadoPagoPedido,
     Pedido,
     TipoDocumento,
+    TIPO_COTIZACION,
+    TIPO_PEDIDO,
 )
 from app.models.pedido_item import PedidoItem
 from app.models.pedido_plan_pago import PedidoPlanPago
@@ -607,6 +610,7 @@ def _build_pedido_response(
         vendedor_id=pedido.vendedor_id,
         vendedor_nombre=pedido.vendedor.nombre_completo if pedido.vendedor else None,
         shipping_status=pedido.shipping_status.value,
+        tipo_pedido=pedido.tipo_pedido,
         payment_status=pedido.payment_status.value,
         semaforo=semaforo,
         tipo_documento=pedido.tipo_documento.value if pedido.tipo_documento else None,
@@ -675,7 +679,15 @@ async def list_pedidos(
     ),
     excluir_borradores: bool = Query(
         False,
-        description="Deja afuera las cotizaciones (pedidos en borrador), que tienen su propia sección",
+        description="Deprecado: usar tipo=pedido. Deja afuera los borradores, no las cotizaciones "
+                    "canceladas sin confirmar (esas quedan con tipo_pedido='cotizacion' pero pueden "
+                    "estar en cualquier shipping_status).",
+    ),
+    tipo: str | None = Query(
+        None,
+        description="cotizacion | pedido. A diferencia de excluir_borradores, filtra por "
+                    "tipo_pedido: una cotización cancelada sin confirmar nunca aparece en "
+                    "tipo=pedido, sea cual sea su shipping_status.",
     ),
     payment_status: str | None = Query(None, description="Filtrar por estado de pago"),
     tipo_documento: str | None = Query(None),
@@ -762,10 +774,17 @@ async def list_pedidos(
         if estados_enum:
             filters.append(Pedido.shipping_status.in_(estados_enum))
 
-    # Las cotizaciones viven en su propia pantalla: no se mezclan con los pedidos
-    # ya confirmados. El filtro explícito por estado manda sobre esto, así que
-    # pedir shipping_status=borrador sigue funcionando.
-    if excluir_borradores and shipping_status is None:
+    if tipo is not None:
+        if tipo not in (TIPO_COTIZACION, TIPO_PEDIDO):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"tipo inválido: {tipo}. Válidos: {TIPO_COTIZACION}, {TIPO_PEDIDO}",
+            )
+        filters.append(Pedido.tipo_pedido == tipo)
+    elif excluir_borradores and shipping_status is None:
+        # Compatibilidad con el filtro viejo: no perfecto (una cotización
+        # cancelada sin confirmar se cuela porque su shipping_status no es
+        # 'borrador'), pero tipo=pedido ya lo reemplaza en el frontend.
         filters.append(Pedido.shipping_status != EstadoDespacho.borrador)
 
     if payment_status is not None:
@@ -1067,7 +1086,7 @@ async def optimizar_ruta(
     ruta.orden_waypoints = json.dumps(waypoints_indices)
     # Fecha real de la ruta (no hoy hardcodeado), para que la invalidación de caché
     # por fecha al editar una ubicación coincida.
-    ruta.fecha_entrega = request.fecha or date.today()
+    ruta.fecha_entrega = request.fecha or hoy_ar()
 
     await db.commit()
 
@@ -1333,10 +1352,10 @@ async def create_pedido(
         cliente_id=body.cliente_id,
         vendedor_id=vendedor_id,
         tipo_documento=tipo_doc,
-        fecha=date.today(),
+        fecha=hoy_ar(),
         # Sugerida a partir de los días de entrega del cliente. Ventas ya no la
         # carga: depósito la confirma o la corrige desde Preparación.
-        fecha_entrega=date.today() + timedelta(days=cliente.dias_entrega or 1),
+        fecha_entrega=hoy_ar() + timedelta(days=cliente.dias_entrega or 1),
         # Si no se eligió transporte, se propone el último que usó el cliente.
         transporte=body.transporte or cliente.transporte_habitual,
         modalidad_entrega=body.modalidad_entrega or _modalidad_por_defecto(cliente),
@@ -1802,6 +1821,11 @@ async def update_shipping_status(
         # 400 diciendo qué producto y cuánto falta, y la transacción se revierte
         # entera — el pedido se queda donde estaba y el stock intacto.
         await _aplicar_cambio_reserva(db, pedido, activar=True)
+
+    # Trinquete: recién acá una cotización pasa a ser un pedido de verdad, y
+    # queda así para siempre (no se revierte ni cancelándolo ni reabriéndolo).
+    if pedido.shipping_status == EstadoDespacho.borrador and nuevo_shipping == EstadoDespacho.pendiente:
+        pedido.tipo_pedido = TIPO_PEDIDO
 
     estado_anterior = pedido.shipping_status
     pedido.shipping_status = nuevo_shipping

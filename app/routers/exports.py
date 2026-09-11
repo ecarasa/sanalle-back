@@ -175,11 +175,12 @@ async def export_pedidos(
     cliente_id: int | None = Query(None, description="Filtrar por cliente"),
     shipping_status: str | None = Query(None, description="Filtrar por estado de despacho"),
     payment_status: str | None = Query(None, description="Filtrar por estado de pago"),
-    excluir_borradores: bool = Query(False, description="Deja afuera las cotizaciones"),
+    excluir_borradores: bool = Query(False, description="Deprecado: usar tipo=pedido"),
+    tipo: str | None = Query(None, description="cotizacion | pedido"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    from app.models.pedido import EstadoDespacho, EstadoPago as EstadoPagoPedido
+    from app.models.pedido import EstadoDespacho, EstadoPago as EstadoPagoPedido, TIPO_COTIZACION, TIPO_PEDIDO
     query = select(Pedido).join(Cliente).join(Pedido.vendedor).options(
         selectinload(Pedido.cliente),
         selectinload(Pedido.vendedor),
@@ -195,7 +196,9 @@ async def export_pedidos(
         except ValueError:
             pass
     # El export tiene que sacar lo mismo que la pantalla desde la que se pide.
-    if excluir_borradores and not shipping_status:
+    if tipo in (TIPO_COTIZACION, TIPO_PEDIDO):
+        query = query.where(Pedido.tipo_pedido == tipo)
+    elif excluir_borradores and not shipping_status:
         query = query.where(Pedido.shipping_status != EstadoDespacho.borrador)
     if payment_status:
         try:

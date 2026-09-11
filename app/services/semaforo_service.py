@@ -1,4 +1,5 @@
 from datetime import date
+from app.utils.tz import hoy_ar
 
 # Umbrales (en días) del semáforo de ACTIVIDAD por recencia de compra.
 # verde  = compró hace <= VERDE_DIAS (da continuidad)
@@ -100,7 +101,7 @@ def calcular_semaforo_pedido(
         return "amarillo"
 
     if fecha_entrega:
-        today = date.today()
+        today = hoy_ar()
         delta = (fecha_entrega - today).days
         if delta <= 1:
             return "rojo"

@@ -23,6 +23,7 @@ from app.schemas.proveedor import (
 )
 from app.services.movimientos_service import registrar_movimiento
 from app.utils.deps import get_current_user, require_role
+from app.utils.tz import hoy_ar
 
 router = APIRouter()
 
@@ -501,7 +502,7 @@ async def pagar_deuda_proveedor(
             pago_proveedor_id=pp.id,
             importe=cashback_importe,
             estado="pendiente",
-            fecha=date.today(),
+            fecha=hoy_ar(),
         ))
 
     await db.commit()
@@ -591,7 +592,7 @@ async def acreditar_cashback(
         numero=f"NC-PROV-{proveedor_id}-{int(datetime.utcnow().timestamp())}",
         tipo=TipoNota.credito,
         proveedor_id=proveedor_id,
-        fecha=date.today(),
+        fecha=hoy_ar(),
         importe_total=total,
         creado_por_id=current_user.id,
     )

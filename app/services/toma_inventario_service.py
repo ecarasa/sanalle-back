@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
+from app.utils.tz import hoy_ar
 from fastapi import HTTPException, status
 from sqlalchemy import and_, func, insert, literal, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,7 +44,7 @@ async def abrir(
         deposito_id=deposito.id,
         estado="borrador",
         origen="manual",
-        fecha=fecha or date.today(),
+        fecha=fecha or hoy_ar(),
         observacion=observacion,
         creado_por_id=usuario_id,
     )

@@ -56,6 +56,13 @@ class ModalidadEntrega(str, enum.Enum):
 # cliente, de la cuenta corriente, del dashboard y de la imputación de pagos.
 ESTADOS_NO_COMPUTABLES = (EstadoDespacho.borrador, EstadoDespacho.cancelado)
 
+# `tipo_pedido` es un trinquete: arranca en cotización y sólo pasa a pedido al
+# confirmarse (borrador -> pendiente). No vuelve atrás aunque el pedido se
+# cancele o se reabra a borrador después — a diferencia de `shipping_status`,
+# que sí es transitorio, esto responde "esto llegó a ser una venta alguna vez".
+TIPO_COTIZACION = "cotizacion"
+TIPO_PEDIDO = "pedido"
+
 
 class Pedido(Base):
     __tablename__ = "pedidos"
@@ -108,6 +115,13 @@ class Pedido(Base):
     # Los valores son los de `TipoPago` para que, cuando se registre el pago de
     # verdad, la forma coincida y no haya que traducir entre dos vocabularios.
     forma_pago: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # cotizacion | pedido. Ver el comentario de TIPO_COTIZACION/TIPO_PEDIDO más
+    # arriba: no se deriva de shipping_status porque necesitamos que quede
+    # marcado para siempre, incluso si el pedido se cancela después de confirmado.
+    tipo_pedido: Mapped[str] = mapped_column(
+        String(20), default=TIPO_COTIZACION, server_default=TIPO_COTIZACION,
+        nullable=False, index=True,
+    )
     despachado: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     sociedad: Mapped[str | None] = mapped_column(String(20), nullable=True)  # "sanalle" | "farmacare"
     importe_total: Mapped[Decimal] = mapped_column(

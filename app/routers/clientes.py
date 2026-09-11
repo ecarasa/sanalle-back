@@ -202,8 +202,9 @@ async def list_clientes(
     # Filtro por semáforo de actividad. Se aplica sobre base_query para que afecte
     # también al conteo total. Umbrales alineados con calcular_semaforo_actividad.
     if actividad:
-        from datetime import date, timedelta
-        hoy = date.today()
+        from datetime import timedelta
+        from app.utils.tz import hoy_ar
+        hoy = hoy_ar()
         verde_desde = hoy - timedelta(days=ACTIVIDAD_VERDE_DIAS)
         amarillo_desde = hoy - timedelta(days=ACTIVIDAD_AMARILLO_DIAS)
         if actividad == "verde":
@@ -253,8 +254,8 @@ async def list_clientes(
     rows = result.all()
 
     items = []
-    from datetime import date
-    today = date.today()
+    from app.utils.tz import hoy_ar
+    today = hoy_ar()
 
     for cliente, deuda, deuda_remitos, deuda_facturas, oldest_fecha, ultima_compra_fecha, vendedor_nombre, localidad_nombre, zona_nombre in rows:
         cliente_dict = ClienteResponse.model_validate(cliente).model_dump()
